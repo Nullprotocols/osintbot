@@ -14,7 +14,7 @@ def get_db():
 
 def init_db():
     with get_db() as conn:
-        # Users table
+        # Users table with last_used column
         conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -25,6 +25,7 @@ def init_db():
                 referrals INTEGER DEFAULT 0,
                 codes_claimed INTEGER DEFAULT 0,
                 joined_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_used TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 banned INTEGER DEFAULT 0,
                 is_admin INTEGER DEFAULT 0
             )
@@ -101,6 +102,11 @@ def add_user(user_id, username, first_name):
         """, (user_id, username, first_name))
         conn.commit()
 
+def update_last_used(user_id):
+    with get_db() as conn:
+        conn.execute("UPDATE users SET last_used = CURRENT_TIMESTAMP WHERE user_id = ?", (user_id,))
+        conn.commit()
+
 def update_user(user_id, username=None, first_name=None):
     with get_db() as conn:
         if username:
@@ -158,19 +164,19 @@ def is_admin(user_id):
 
 def get_all_users():
     with get_db() as conn:
-        rows = conn.execute("SELECT user_id, username, first_name, credits, total_earned, referrals, codes_claimed, joined_date, banned, is_admin FROM users").fetchall()
+        rows = conn.execute("SELECT user_id, username, first_name, credits, total_earned, referrals, codes_claimed, joined_date, last_used, banned, is_admin FROM users").fetchall()
         return [dict(row) for row in rows]
 
 def get_users_page(page=1, per_page=10):
     offset = (page - 1) * per_page
     with get_db() as conn:
-        rows = conn.execute("SELECT user_id, username, first_name, credits, total_earned, referrals, codes_claimed, joined_date, banned, is_admin FROM users ORDER BY joined_date DESC LIMIT ? OFFSET ?", (per_page, offset)).fetchall()
+        rows = conn.execute("SELECT user_id, username, first_name, credits, total_earned, referrals, codes_claimed, joined_date, last_used, banned, is_admin FROM users ORDER BY joined_date DESC LIMIT ? OFFSET ?", (per_page, offset)).fetchall()
         total = conn.execute("SELECT COUNT(*) as count FROM users").fetchone()['count']
         return [dict(row) for row in rows], total
 
 def search_users(query):
     with get_db() as conn:
-        rows = conn.execute("SELECT user_id, username, first_name, credits, total_earned, referrals, codes_claimed, joined_date, banned, is_admin FROM users WHERE user_id LIKE ? OR username LIKE ? OR first_name LIKE ?", (f'%{query}%', f'%{query}%', f'%{query}%')).fetchall()
+        rows = conn.execute("SELECT user_id, username, first_name, credits, total_earned, referrals, codes_claimed, joined_date, last_used, banned, is_admin FROM users WHERE user_id LIKE ? OR username LIKE ? OR first_name LIKE ?", (f'%{query}%', f'%{query}%', f'%{query}%')).fetchall()
         return [dict(row) for row in rows]
 
 def get_recent_users(days):
@@ -243,7 +249,6 @@ def redeem_code(user_id, code):
         already = conn.execute("SELECT 1 FROM redeemed_codes WHERE user_id = ? AND code = ?", (user_id, code)).fetchone()
         if already:
             return False, "Already redeemed"
-        # Deduct? Actually redeem gives credits
         conn.execute("UPDATE codes SET uses = uses + 1 WHERE code = ?", (code,))
         conn.execute("INSERT INTO redeemed_codes (user_id, code) VALUES (?, ?)", (user_id, code))
         conn.execute("UPDATE users SET credits = credits + ?, codes_claimed = codes_claimed + 1 WHERE user_id = ?", (code_data['amount'], user_id))
