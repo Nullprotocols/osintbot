@@ -99,9 +99,9 @@ BRANDING = "\n\n---\n👨‍💻 developer: @Nullprotocol_X\n⚡ powered_by: NUL
 
 # ---------- ब्रांडिंग हटाने वाला फंक्शन (सिर्फ num के लिए) ----------
 UNWANTED_BRANDS = {
-    '@patelkrish_99', 'patelkrish_99', 't.me/anshapi', 'anshapi',
-    '"@Kon_Hu_Mai"', 'Kon_Hu_Mai', '@kon_hu_mai',
-    'Dm to buy access', '"Dm to buy access"', 'dm to buy', 'owner'
+    '@patelkrish_99', 'patelkrish_99', 't.me/anshapi', 'anshapi', 'validity'
+    '"@Kon_Hu_Mai"', 'Kon_Hu_Mai', '@kon_hu_mai', 'hours_remaining', 'days_remaining', 'April 6, 2026', 'expires_on', 'channel',
+    'Dm to buy access', '"Dm to buy access"', 'dm to buy', 'owner', 'credit', 'code', '@AbdulDevStoreBot', 'AbdulDevStoreBot', 'https://t.me/AbdulBotzOfficial'
 }
 
 def clean_json_data(data, command_name):
