@@ -20,7 +20,8 @@ from database import (
     check_expired_codes, clean_expired_codes,
     log_lookup, get_lookup_stats,
     is_premium_for_all, set_premium_for_all, is_free_credits_on_join, set_free_credits_on_join,
-    get_setting, set_setting
+    get_setting, set_setting,
+    update_last_used   # यह नया import
 )
 
 load_dotenv()
@@ -99,7 +100,7 @@ BRANDING = "\n\n---\n👨‍💻 developer: @Nullprotocol_X\n⚡ powered_by: NUL
 
 # ---------- ब्रांडिंग हटाने वाला फंक्शन (सिर्फ num के लिए) ----------
 UNWANTED_BRANDS = {
-    '@patelkrish_99', 'patelkrish_99', 't.me/anshapi', 'anshapi', 'validity'
+    '@patelkrish_99', 'patelkrish_99', 't.me/anshapi', 'anshapi', 'validity',
     '"@Kon_Hu_Mai"', 'Kon_Hu_Mai', '@kon_hu_mai', 'hours_remaining', 'days_remaining', 'April 6, 2026', 'expires_on', 'channel',
     'Dm to buy access', '"Dm to buy access"', 'dm to buy', 'owner', 'credit', 'code', '@AbdulDevStoreBot', 'AbdulDevStoreBot', 'https://t.me/AbdulBotzOfficial'
 }
@@ -112,12 +113,11 @@ def clean_json_data(data, command_name):
     if isinstance(data, dict):
         cleaned = {}
         for key, value in data.items():
-            # value को साफ करें
             if isinstance(value, str):
                 for brand in UNWANTED_BRANDS:
                     value = value.replace(brand, '').strip()
                 if value == '':
-                    continue  # पूरी तरह खाली हो तो हटा दें
+                    continue
             elif isinstance(value, (dict, list)):
                 value = clean_json_data(value, command_name)
             cleaned[key] = value
@@ -127,7 +127,6 @@ def clean_json_data(data, command_name):
         cleaned = []
         for item in data:
             cleaned_item = clean_json_data(item, command_name)
-            # अगर item डिक्शनरी है और खाली हो गई तो मत जोड़ो
             if isinstance(cleaned_item, dict) and not cleaned_item:
                 continue
             if isinstance(cleaned_item, str) and cleaned_item == '':
@@ -153,7 +152,6 @@ async def is_user_in_channel(user_id: int, channel_id: int, context: ContextType
 
 async def force_channel_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user_id = update.effective_user.id
-    # Admin exempt
     if is_admin(user_id):
         return True
     not_joined = []
@@ -242,6 +240,7 @@ async def private_message_handler(update: Update, context: ContextTypes.DEFAULT_
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     add_user(user.id, user.username, user.first_name)
+    update_last_used(user.id)
 
     # Check for referral
     if context.args and context.args[0].startswith("ref_"):
@@ -276,6 +275,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    update_last_used(user.id)
     if update.effective_chat.type == "private" and not is_premium_for_all():
         await private_message_handler(update, context)
         return
@@ -355,6 +355,7 @@ async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def create_api_handler(cmd_name):
     async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
+        update_last_used(user.id)
         if update.effective_chat.type == "private" and not is_premium_for_all():
             await private_message_handler(update, context)
             return
@@ -381,6 +382,7 @@ def create_api_handler(cmd_name):
 # ---------- User Commands ----------
 async def myprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    update_last_used(user.id)
     if update.effective_chat.type == "private" and not is_premium_for_all():
         await private_message_handler(update, context)
         return
@@ -407,6 +409,7 @@ async def myprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def refer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    update_last_used(user.id)
     if update.effective_chat.type == "private" and not is_premium_for_all():
         await private_message_handler(update, context)
         return
@@ -429,6 +432,7 @@ async def refer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    update_last_used(user.id)
     if update.effective_chat.type == "private" and not is_premium_for_all():
         await private_message_handler(update, context)
         return
@@ -446,6 +450,8 @@ async def redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Redeem fail: {result}")
 
 async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    update_last_used(user.id)
     if update.effective_chat.type == "private" and not is_premium_for_all():
         await private_message_handler(update, context)
         return
@@ -999,7 +1005,7 @@ async def fulldbbackup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         import io
         users = get_all_users()
         output = io.StringIO()
-        writer = csv.DictWriter(output, fieldnames=['user_id','username','first_name','credits','total_earned','referrals','codes_claimed','joined_date','banned','is_admin'])
+        writer = csv.DictWriter(output, fieldnames=['user_id','username','first_name','credits','total_earned','referrals','codes_claimed','joined_date','last_used','banned','is_admin'])
         writer.writeheader()
         writer.writerows(users)
         await context.bot.send_document(chat_id=user.id, document=io.BytesIO(output.getvalue().encode()), filename='users.csv')
@@ -1051,7 +1057,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "refresh":
         json_data = await fetch_api(full_url)
         if json_data:
-            # Refresh mein bhi branding hatayenge
             cleaned_data = clean_json_data(json_data, command)
             formatted = json.dumps(cleaned_data, indent=2, ensure_ascii=False)
             if len(formatted) > 3800:
