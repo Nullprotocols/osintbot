@@ -1,756 +1,786 @@
+# main.py
 import os
+import sys
 import json
+import asyncio
 import logging
-import threading
 import re
-import requests
-from datetime import datetime, timedelta
-from flask import Flask
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
-from telegram.constants import ParseMode
-from dotenv import load_dotenv
-import database as db
+from datetime import datetime, date, timedelta
+from typing import Dict, List, Optional, Union, Any
+from contextlib import asynccontextmanager
 
-load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-
-# Force channels
-FORCE_CHANNELS = [
-    {"link": os.getenv("FORCE_CHANNEL1_LINK"), "id": int(os.getenv("FORCE_CHANNEL1_ID"))},
-    {"link": os.getenv("FORCE_CHANNEL2_LINK"), "id": int(os.getenv("FORCE_CHANNEL2_ID"))},
-]
-
-# Log channels mapping (command -> channel_id)
-LOG_CHANNELS = {
-    "num": int(os.getenv("LOG_CHANNEL_NUM")),
-    "ifsc": int(os.getenv("LOG_CHANNEL_IFSC")),
-    "email": int(os.getenv("LOG_CHANNEL_EMAIL")),
-    "gst": int(os.getenv("LOG_CHANNEL_GST")),
-    "vehicle": int(os.getenv("LOG_CHANNEL_VEHICLE")),
-    "vchalan": int(os.getenv("LOG_CHANNEL_CHALAN")),
-    "pin": int(os.getenv("LOG_CHANNEL_PINCODE")),
-    "insta": int(os.getenv("LOG_CHANNEL_INSTAGRAM")),
-    "git": int(os.getenv("LOG_CHANNEL_GITHUB")),
-    "pak": int(os.getenv("LOG_CHANNEL_PAKISTAN")),
-    "ip": int(os.getenv("LOG_CHANNEL_IP")),
-    "ffinfo": int(os.getenv("LOG_CHANNEL_FF_INFO")),
-    "ffban": int(os.getenv("LOG_CHANNEL_FF_BAN")),
-    "tg2num": int(os.getenv("LOG_CHANNEL_TG2NUM")),
-    "tginfo": int(os.getenv("LOG_CHANNEL_TG_TO_INFO")),
-    "tginfopro": int(os.getenv("LOG_CHANNEL_TGPRO")),
-}
-
-# Admin/Owner IDs
-ADMIN_IDS = [int(x.strip()) for x in os.getenv("BOT_ADMIN_IDS", "").split(",") if x.strip()]
-OWNER_ID = int(os.getenv("BOT_OWNER_ID"))
-
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+import aiohttp
+from aiohttp import web
+import aiogram
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.enums import ParseMode, ChatMemberStatus
+from aiogram.filters import Command, CommandObject
+from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.exceptions import (
+    TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter,
+    TelegramAPIError
 )
+import aiosqlite
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Flask ऐप (Render के लिए)
-flask_app = Flask(__name__)
+# Constants
+OWNER_ID = 8104850843
+ADMIN_IDS = [8104850843, 5987905091]
+FORCE_JOIN_CHANNELS = [
+    {"username": "all_data_here", "id": -1003090922367},
+    {"username": "osint_lookup", "id": -1003698567122}
+]
+LOG_CHANNELS = {
+    "num": -1003482423742,
+    "ifsc": -1003624886596,
+    "email": -1003431549612,
+    "gst": -1003634866992,
+    "vehicle": -1003237155636,
+    "pincode": -1003677285823,
+    "instagram": -1003498414978,
+    "github": -1003576017442,
+    "pakistan": -1003663672738,
+    "ip": -1003665811220,
+    "ff_info": -1003588577282,
+    "ff_ban": -1003521974255,
+    "tg2num": -1003642820243,
+    "chalan": -1003237155636,
+    "tg_to_info": -1003643170105,
+    "tgpro": -1003643170105
+}
+BRANDING_BLOCKLIST = [
+    "@patelkrish_99", "patelkrish_99", "t.me/anshapi", "anshapi", "@Kon_Hu_Mai", "Dm to buy access", "Kon_Hu_Mai"
+]
+EXTRA_NUMBER_BLOCK = [
+    "dm to buy", "owner", "@kon_hu_mai", "Ruk ja bhencho itne m kya unlimited request lega?? Paid lena h to bolo 100-400₹ @Simpleguy444"
+]
+API_ENDPOINTS = {
+    "num": "https://num-free-rootx-jai-shree-ram-14-day.vercel.app/?key=lundkinger&number={}",
+    "tg2num": "https://tg2num-owner-api.vercel.app/?userid={}",
+    "vehicle": "https://vehicle-info-aco-api.vercel.app/info?vehicle={}",
+    "vchalan": "https://api.b77bf911.workers.dev/vehicle?registration={}",
+    "ip": "https://abbas-apis.vercel.app/api/ip?ip={}",
+    "email": "https://abbas-apis.vercel.app/api/email?mail={}",
+    "ffinfo": "https://official-free-fire-info.onrender.com/player-info?key=DV_M7-INFO_API&uid={}",
+    "ffban": "https://abbas-apis.vercel.app/api/ff-ban?uid={}",
+    "pin": "https://api.postalpincode.in/pincode/{}",
+    "ifsc": "https://abbas-apis.vercel.app/api/ifsc?ifsc={}",
+    "gst": "https://api.b77bf911.workers.dev/gst?number={}",
+    "insta": "https://mkhossain.alwaysdata.net/instanum.php?username={}",
+    "tginfo": "https://openosintx.vippanel.in/tgusrinfo.php?key=OpenOSINTX-FREE&user={}",
+    "tginfopro": "https://api.b77bf911.workers.dev/telegram?user={}",
+    "git": "https://abbas-apis.vercel.app/api/github?username={}",
+    "pak": "https://abbas-apis.vercel.app/api/pakistan?number={}"
+}
 
-@flask_app.route('/')
-def home():
-    return "OSINT Bot is running!", 200
+# Initialize bot and dispatcher
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    logger.error("BOT_TOKEN not set in environment")
+    sys.exit(1)
 
-@flask_app.route('/health')
-def health():
-    return "OK", 200
+bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+dp = Dispatcher()
 
-# ================== डेटाबेस इनिशियलाइज़ ==================
-db.init_db()
+# Database import (from database.py)
+from database import Database
 
-# ================== यूटिलिटी फंक्शन ==================
+# Global database instance
+db = None
 
-def is_user_admin_or_owner(user_id):
-    """चेक करें कि यूजर एडमिन या ओनर है (डेटाबेस और एनवायरनमेंट दोनों से)"""
-    if user_id == OWNER_ID:
-        return True
-    if user_id in ADMIN_IDS:
-        return True
-    user = db.get_user(user_id)
-    if user and (user[5] == 1 or user[6] == 1):
-        return True
-    return False
+# Self-ping task handle
+self_ping_task = None
 
-async def check_force_channels(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """चेक करें कि यूजर दोनों फोर्स चैनल में है या नहीं। अगर नहीं, तो मैसेज भेजें और False लौटाएँ।"""
-    user_id = update.effective_user.id
-    if is_user_admin_or_owner(user_id):
-        return True  # एडमिन/ओनर को फोर्स चैनल की जरूरत नहीं
+# -------------------------------------------------------------------
+# Utility functions
+# -------------------------------------------------------------------
 
-    not_joined = []
-    for channel in FORCE_CHANNELS:
+def clean_branding(text: str, command: str = None) -> str:
+    """Remove banned phrases from text."""
+    if not text:
+        return text
+    blocklist = BRANDING_BLOCKLIST.copy()
+    if command == "num":
+        blocklist.extend(EXTRA_NUMBER_BLOCK)
+    for phrase in blocklist:
+        text = text.replace(phrase, "")
+    # Also remove extra whitespace caused by removal
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+async def fetch_api(url: str, retries: int = 3) -> Optional[Any]:
+    """Fetch API with retry and backoff."""
+    for attempt in range(retries):
         try:
-            member = await context.bot.get_chat_member(chat_id=channel["id"], user_id=user_id)
-            if member.status in ['left', 'kicked']:
-                not_joined.append(channel["link"])
-        except Exception as e:
-            logger.error(f"Force channel check error: {e}")
-            not_joined.append(channel["link"])  # अगर चेक न कर पाए तो भी ज्वाइन करने को कहें
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=10) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+                    else:
+                        logger.warning(f"API returned {resp.status} for {url}")
+                        return None
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout on attempt {attempt+1} for {url}")
+        except aiohttp.ClientError as e:
+            logger.warning(f"Client error on attempt {attempt+1}: {e}")
+        if attempt < retries - 1:
+            await asyncio.sleep(2 ** attempt)
+    return None
 
-    if not_joined:
-        buttons = []
-        for link in not_joined:
-            buttons.append([InlineKeyboardButton("🔔 जॉइन करें", url=link)])
-        buttons.append([InlineKeyboardButton("✅ जॉइन किया", callback_data="check_joined")])
-        reply_markup = InlineKeyboardMarkup(buttons)
-        await update.message.reply_text(
-            "आपने बॉट का उपयोग करने के लिए निम्नलिखित चैनल जॉइन नहीं किए हैं। कृपया जॉइन करें और फिर 'जॉइन किया' बटन दबाएँ।",
-            reply_markup=reply_markup
-        )
-        return False
-    return True
-
-async def check_group_only(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """अगर प्राइवेट चैट में है तो मैसेज भेजें और False लौटाएँ।"""
-    if update.effective_chat.type == "private":
-        # एडमिन/ओनर को प्राइवेट में भी चलने दें
-        if is_user_admin_or_owner(update.effective_user.id):
-            return True
-        await update.message.reply_text(
-            "🤖 यह बॉट केवल **समूहों (groups)** में काम करता है।\n"
-            "यदि आप निजी तौर पर OSINT टूल्स का उपयोग करना चाहते हैं, तो कृपया हमारे दूसरे बॉट का उपयोग करें: @osintfatherNullBot"
-        )
-        return False
-    return True
-
-async def log_to_channel(update: Update, command: str, result: str = ""):
-    """कमांड के अनुसार लॉग चैनल पर मैसेज भेजें।"""
-    channel_id = LOG_CHANNELS.get(command)
-    if not channel_id:
-        return
-    user = update.effective_user
-    chat = update.effective_chat
-    message = (
-        f"👤 User: {user.full_name} (@{user.username})\n"
-        f"🆔 ID: {user.id}\n"
-        f"💬 Chat: {chat.title if chat.title else chat.type}\n"
-        f"📝 Command: /{command} {' '.join(update.message.text.split()[1:])}\n"
-        f"⏱ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"📊 Result snippet: {result[:200]}"
-    )
-    try:
-        await context.bot.send_message(chat_id=channel_id, text=message)
-    except Exception as e:
-        logger.error(f"Failed to log to channel {channel_id}: {e}")
-
-def call_api(url):
-    """किसी भी API को कॉल करके JSON रिस्पॉन्स लौटाता है।"""
-    try:
-        resp = requests.get(url, timeout=10)
-        if resp.status_code == 200:
-            return resp.json()
-        else:
-            return {"error": f"API Error: HTTP {resp.status_code}"}
-    except Exception as e:
-        return {"error": f"Request failed: {str(e)}"}
-
-def clean_number_api_output(data):
-    """API_NUM के आउटपुट से अवांछित ब्रांडिंग हटाता है।"""
-    banned_phrases = [
-        'dm to buy', 'owner', '@kon_hu_mai', 'Ruk ja bhencho itne m kya unlimited request lega?? Paid lena h to bolo 100-400₹ @Simpleguy444',
-        '@patelkrish_99', 'patelkrish_99', 't.me/anshapi', 'anshapi', '"@Kon_Hu_Mai"', 'Dm to buy access', '"Dm to buy access"', 'Kon_Hu_Mai'
-    ]
-    
-    def clean_string(s):
-        if isinstance(s, str):
-            for phrase in banned_phrases:
-                s = s.replace(phrase, '')
-            s = re.sub(r'\s+', ' ', s).strip()
-            return s
-        return s
-
-    def clean_obj(obj):
-        if isinstance(obj, dict):
-            return {k: clean_obj(v) for k, v in obj.items()}
-        elif isinstance(obj, list):
-            return [clean_obj(item) for item in obj]
-        elif isinstance(obj, str):
-            return clean_string(obj)
-        else:
-            return obj
-
-    return clean_obj(data)
-
-def format_json_output(api_name, json_data):
-    """JSON डेटा को सुंदर स्ट्रिंग में बदलता है, और फुटर में ब्रांडिंग जोड़ता है।"""
-    pretty_json = json.dumps(json_data, indent=2, ensure_ascii=False)
-    footer = "\n\n---\n👨‍💻 developer: @Nullprotocol_X\n⚡ powered_by: NULL PROTOCOL"
-    return f"```json\n{pretty_json}\n```{footer}"
-
-# ================== कमांड हैंडलर ==================
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    db.add_user(user.id, user.username, user.first_name, user.last_name)
-    if not await check_group_only(update, context):
-        return
-    if not await check_force_channels(update, context):
-        return
-    await update.message.reply_text(
-        f"नमस्ते {user.first_name}! मैं OSINT बॉट हूँ। /help से सभी कमांड देखें।"
-    )
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_group_only(update, context):
-        return
-    if not await check_force_channels(update, context):
-        return
-    help_text = """
-    उपलब्ध कमांड:
-    /num <10 अंकों का नंबर> - मोबाइल नंबर की जानकारी
-    /tg2num <टेलीग्राम ID> - टेलीग्राम ID से नंबर
-    /vehicle <गाड़ी नंबर> - वाहन मालिक की जानकारी
-    /vchalan <गाड़ी नंबर> - वाहन चालान की जानकारी
-    /ip <IP एड्रेस> - IP जानकारी
-    /email <ईमेल> - ईमेल जानकारी
-    /ffinfo <FF UID> - फ्री फायर प्रोफाइल
-    /ffban <FF UID> - फ्री फायर बान स्टेटस
-    /pin <पिनकोड> - पिनकोड विवरण
-    /ifsc <IFSC कोड> - बैंक शाखा जानकारी
-    /gst <GST नंबर> - GST जानकारी
-    /insta <इंस्टाग्राम यूजरनेम> - इंस्टाग्राम जानकारी
-    /tginfo <@टेलीग्राम यूजरनेम> - टेलीग्राम यूजर जानकारी
-    /tginfopro <टेलीग्राम ID> - टेलीग्राम प्रो जानकारी
-    /git <गिटहब यूजरनेम> - गिटहब जानकारी
-    /pak <पाकिस्तान नंबर> - पाकिस्तान नंबर जानकारी
-    """
-    await update.message.reply_text(help_text)
-
-# OSINT कमांड्स के लिए जेनेरिक हैंडलर
-async def handle_api_command(update: Update, context: ContextTypes.DEFAULT_TYPE, api_url_template, command_name, arg_name="query"):
-    if not await check_group_only(update, context):
-        return
-    if not await check_force_channels(update, context):
-        return
-
-    if not context.args:
-        await update.message.reply_text(f"कृपया {arg_name} प्रदान करें।")
-        return
-
-    user_input = context.args[0]
-    url = api_url_template + user_input
-
-    data = call_api(url)
-
-    # अगर नंबर API है तो ब्रांडिंग हटाएँ
-    if 'num-free-rootx' in api_url_template:
-        data = clean_number_api_output(data)
-
-    # लॉग डेटाबेस में जोड़ें
-    db.log_command(update.effective_user.id, command_name, str(data)[:200])
-
-    # लॉग चैनल पर भेजें
-    await log_to_channel(update, command_name, str(data)[:200])
-
-    formatted = format_json_output(command_name, data)
-
-    # कॉपी बटन
-    keyboard = [[InlineKeyboardButton("📋 JSON कॉपी करें", callback_data=f"copy_{url}")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await update.message.reply_text(
-        formatted,
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=reply_markup
-    )
-
-# सभी OSINT कमांड्स को परिभाषित करें
-async def num_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await handle_api_command(update, context, "https://num-free-rootx-jai-shree-ram-14-day.vercel.app/?key=lundkinger&number=", "num", "10 digit number")
-
-async def tg2num_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await handle_api_command(update, context, "https://tg2num-owner-api.vercel.app/?userid=", "tg2num", "Telegram ID")
-
-async def vehicle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await handle_api_command(update, context, "https://vehicle-info-aco-api.vercel.app/info?vehicle=", "vehicle", "vehicle number")
-
-async def vchalan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await handle_api_command(update, context, "https://api.b77bf911.workers.dev/vehicle?registration=", "vchalan", "vehicle number")
-
-async def ip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await handle_api_command(update, context, "https://abbas-apis.vercel.app/api/ip?ip=", "ip", "IP address")
-
-async def email_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await handle_api_command(update, context, "https://abbas-apis.vercel.app/api/email?mail=", "email", "email address")
-
-async def ffinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await handle_api_command(update, context, "https://official-free-fire-info.onrender.com/player-info?key=DV_M7-INFO_API&uid=", "ffinfo", "Free Fire UID")
-
-async def ffban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await handle_api_command(update, context, "https://abbas-apis.vercel.app/api/ff-ban?uid=", "ffban", "Free Fire UID")
-
-async def pin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await handle_api_command(update, context, "https://api.postalpincode.in/pincode/", "pin", "pincode")
-
-async def ifsc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await handle_api_command(update, context, "https://abbas-apis.vercel.app/api/ifsc?ifsc=", "ifsc", "IFSC code")
-
-async def gst_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await handle_api_command(update, context, "https://api.b77bf911.workers.dev/gst?number=", "gst", "GST number")
-
-async def insta_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await handle_api_command(update, context, "https://mkhossain.alwaysdata.net/instanum.php?username=", "insta", "Instagram username")
-
-async def tginfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await handle_api_command(update, context, "https://openosintx.vippanel.in/tgusrinfo.php?key=OpenOSINTX-FREE&user=", "tginfo", "Telegram username with @")
-
-async def tginfopro_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await handle_api_command(update, context, "https://api.b77bf911.workers.dev/telegram?user=", "tginfopro", "Telegram ID")
-
-async def git_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await handle_api_command(update, context, "https://abbas-apis.vercel.app/api/github?username=", "git", "GitHub username")
-
-async def pak_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await handle_api_command(update, context, "https://abbas-apis.vercel.app/api/pakistan?number=", "pak", "Pakistan number")
-
-# ================== कॉलबैक हैंडलर (JSON कॉपी + चेक जॉइन) ==================
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if query.data == "check_joined":
-        # फिर से चेक करें
-        user_id = query.from_user.id
-        not_joined = []
-        for channel in FORCE_CHANNELS:
-            try:
-                member = await context.bot.get_chat_member(chat_id=channel["id"], user_id=user_id)
-                if member.status in ['left', 'kicked']:
-                    not_joined.append(channel["link"])
-            except:
-                not_joined.append(channel["link"])
-        if not_joined:
-            await query.edit_message_text("आप अभी भी सभी चैनल में नहीं हैं। कृपया जॉइन करें और पुनः प्रयास करें।")
-        else:
-            await query.edit_message_text("धन्यवाद! अब आप बॉट का उपयोग कर सकते हैं। कृपया /start दबाएँ।")
-        return
-
-    if query.data.startswith("copy_"):
-        url = query.data[5:]
-        data = call_api(url)
-        if 'num-free-rootx' in url:
-            data = clean_number_api_output(data)
-        plain_json = json.dumps(data, indent=2, ensure_ascii=False)
-        await context.bot.send_message(
-            chat_id=query.message.chat_id,
-            text=f"```json\n{plain_json}\n```",
-            parse_mode=ParseMode.MARKDOWN
-        )
-
-# ================== एडमिन कमांड्स ==================
-
-def admin_only(func):
-    """डेकोरेटर: केवल एडमिन/ओनर को ही कमांड एक्सेस दे"""
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
-        if not is_user_admin_or_owner(update.effective_user.id):
-            await update.message.reply_text("⛔ आपके पास इस कमांड का उपयोग करने की अनुमति नहीं है।")
-            return
-        return await func(update, context, *args, **kwargs)
-    return wrapper
-
-@admin_only
-async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """ब्रॉडकास्ट मैसेज सभी यूजर्स को भेजें। टेक्स्ट, फोटो, वीडियो, पोल आदि सपोर्ट करता है।"""
-    # यूजर्स की लिस्ट लें
-    users = db.get_all_users(limit=1000000)  # सभी यूजर्स (बेहतर होगा batch में)
-    if not users:
-        await update.message.reply_text("कोई यूजर नहीं है।")
-        return
-
-    # मैसेज टाइप पहचानें: अगर रिप्लाई किया गया है तो उसी मीडिया को फॉरवर्ड करें
-    reply = update.message.reply_to_message
-    if reply:
-        # रिप्लाई की गई मैसेज को फॉरवर्ड करें
-        success = 0
-        failed = 0
-        for user in users:
-            try:
-                await reply.forward(chat_id=user[0])
-                success += 1
-            except Exception as e:
-                failed += 1
-                logger.error(f"Broadcast to {user[0]} failed: {e}")
-        await update.message.reply_text(f"✅ ब्रॉडकास्ट पूरा हुआ!\nसफल: {success}\nअसफल: {failed}")
+def format_result(data: Any, command: str) -> str:
+    """Format API result as preformatted JSON with footer."""
+    if data is None:
+        text = "No data or error."
     else:
-        # टेक्स्ट मैसेज
-        if not context.args:
-            await update.message.reply_text("कृपया ब्रॉडकास्ट टेक्स्ट दें या किसी मैसेज को रिप्लाई करें।")
-            return
-        text = " ".join(context.args)
-        success = 0
-        failed = 0
-        for user in users:
-            try:
-                await context.bot.send_message(chat_id=user[0], text=text)
-                success += 1
-            except Exception as e:
-                failed += 1
-                logger.error(f"Broadcast to {user[0]} failed: {e}")
-        await update.message.reply_text(f"✅ ब्रॉडकास्ट पूरा हुआ!\nसफल: {success}\nअसफल: {failed}")
-
-@admin_only
-async def dm_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """किसी एक यूजर को डायरेक्ट मैसेज भेजें। /dm ID मैसेज"""
-    if len(context.args) < 2:
-        await update.message.reply_text("उपयोग: /dm user_id मैसेज")
-        return
-    try:
-        user_id = int(context.args[0])
-        msg = " ".join(context.args[1:])
-        await context.bot.send_message(chat_id=user_id, text=msg)
-        await update.message.reply_text(f"✅ मैसेज {user_id} को भेज दिया गया।")
-    except Exception as e:
-        await update.message.reply_text(f"❌ भेजने में विफल: {e}")
-
-@admin_only
-async def bulkdm_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """एक साथ कई यूजर्स को मैसेज भेजें। /bulkdm ID1,ID2,ID3 मैसेज"""
-    if len(context.args) < 2:
-        await update.message.reply_text("उपयोग: /bulkdm ID1,ID2,ID3 मैसेज")
-        return
-    ids_part = context.args[0]
-    msg = " ".join(context.args[1:])
-    id_list = [int(x.strip()) for x in ids_part.split(",") if x.strip().isdigit()]
-    if not id_list:
-        await update.message.reply_text("कोई वैलिड ID नहीं मिली।")
-        return
-    success = 0
-    failed = 0
-    for uid in id_list:
         try:
-            await context.bot.send_message(chat_id=uid, text=msg)
-            success += 1
+            text = json.dumps(data, indent=2, ensure_ascii=False)
         except:
+            text = str(data)
+    footer = "\n\ndeveloper: @Nullprotocol_X\npowered_by: NULL PROTOCOL"
+    return f"<pre>{text}</pre>{footer}"
+
+def get_result_keyboard() -> InlineKeyboardMarkup:
+    """Inline buttons for copy and search."""
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="Copy", callback_data="copy"),
+        InlineKeyboardButton(text="Search", switch_inline_query="")
+    )
+    return builder.as_markup()
+
+async def check_force_join(user_id: int) -> bool:
+    """Check if user joined both required channels. Admins bypass."""
+    # Check if admin
+    async with db.execute("SELECT user_id FROM admins WHERE user_id = ?", (user_id,)) as cursor:
+        if await cursor.fetchone():
+            return True
+    for channel in FORCE_JOIN_CHANNELS:
+        try:
+            member = await bot.get_chat_member(chat_id=channel["id"], user_id=user_id)
+            if member.status in [ChatMemberStatus.LEFT, ChatMemberStatus.KICKED]:
+                return False
+        except (TelegramBadRequest, TelegramForbiddenError) as e:
+            logger.warning(f"Force join check failed for {user_id} in {channel['id']}: {e}")
+            # If channel inaccessible, treat as not joined
+            return False
+    return True
+
+async def send_force_join_prompt(message: Message):
+    """Send force join message with buttons."""
+    builder = InlineKeyboardBuilder()
+    for ch in FORCE_JOIN_CHANNELS:
+        builder.row(InlineKeyboardButton(text=f"Join {ch['username']}", url=f"https://t.me/{ch['username']}"))
+    builder.row(InlineKeyboardButton(text="✅ Done", callback_data="check_join"))
+    await message.reply(
+        "Please join both channels to use the bot:",
+        reply_markup=builder.as_markup()
+    )
+
+async def log_lookup(command: str, user_id: int, query: str, result: Any):
+    """Send log to appropriate channel."""
+    log_channel = LOG_CHANNELS.get(command)
+    if not log_channel:
+        return
+    try:
+        log_text = f"User: {user_id}\nQuery: {query}\nResult: {json.dumps(result, indent=2, ensure_ascii=False)}"
+        # Telegram message limit ~4096, split if needed
+        if len(log_text) > 4000:
+            log_text = log_text[:4000] + "..."
+        await bot.send_message(log_channel, log_text)
+    except Exception as e:
+        logger.error(f"Failed to log lookup: {e}")
+
+async def ensure_user_in_db(user_id: int, username: str = None, first_name: str = None):
+    """Insert or update user in database."""
+    now = datetime.utcnow().isoformat()
+    async with db.execute(
+        "INSERT OR IGNORE INTO users (user_id, username, first_name, first_seen, last_seen, total_lookups) VALUES (?, ?, ?, ?, ?, 0)",
+        (user_id, username, first_name, now, now)
+    ) as cursor:
+        pass
+    async with db.execute(
+        "UPDATE users SET last_seen = ?, username = ?, first_name = ? WHERE user_id = ?",
+        (now, username, first_name, user_id)
+    ) as cursor:
+        pass
+    await db.commit()
+
+async def increment_lookups(user_id: int):
+    async with db.execute(
+        "UPDATE users SET total_lookups = total_lookups + 1 WHERE user_id = ?",
+        (user_id,)
+    ) as cursor:
+        pass
+    await db.commit()
+
+async def update_daily_stats(command: str):
+    today = date.today().isoformat()
+    async with db.execute(
+        "INSERT INTO daily_stats (date, command, count) VALUES (?, ?, 1) ON CONFLICT(date, command) DO UPDATE SET count = count + 1",
+        (today, command)
+    ) as cursor:
+        pass
+    await db.commit()
+
+# -------------------------------------------------------------------
+# Permission checks
+# -------------------------------------------------------------------
+
+def is_owner(user_id: int) -> bool:
+    return user_id == OWNER_ID
+
+async def is_admin(user_id: int) -> bool:
+    if is_owner(user_id):
+        return True
+    async with db.execute("SELECT user_id FROM admins WHERE user_id = ?", (user_id,)) as cursor:
+        return await cursor.fetchone() is not None
+
+async def is_banned(user_id: int) -> bool:
+    async with db.execute("SELECT user_id FROM banned WHERE user_id = ?", (user_id,)) as cursor:
+        return await cursor.fetchone() is not None
+
+async def check_group_and_join(message: Message) -> bool:
+    """Verify that message is in group and user has joined channels."""
+    if message.chat.type not in ["group", "supergroup"]:
+        # Private chat: allow only if owner/admin
+        if await is_admin(message.from_user.id):
+            return True
+        await message.reply("Ye bot sirf group me kaam karta hai.\nPersonal use ke liye use kare: @osintfatherNullBot")
+        return False
+    # Check ban
+    if await is_banned(message.from_user.id):
+        await message.reply("You are banned.")
+        return False
+    # Force join check for non-admins
+    if not await is_admin(message.from_user.id):
+        if not await check_force_join(message.from_user.id):
+            await send_force_join_prompt(message)
+            return False
+    return True
+
+# -------------------------------------------------------------------
+# Command Handlers (OSINT commands)
+# -------------------------------------------------------------------
+
+async def handle_osint_command(message: Message, command: str, arg: str):
+    """Generic handler for OSINT commands."""
+    if not await check_group_and_join(message):
+        return
+    if not arg:
+        await message.reply(f"Usage: /{command} <query>")
+        return
+    await ensure_user_in_db(message.from_user.id, message.from_user.username, message.from_user.first_name)
+    await increment_lookups(message.from_user.id)
+    await update_daily_stats(command)
+    url = API_ENDPOINTS[command].format(arg)
+    data = await fetch_api(url)
+    cleaned_data = None
+    if data:
+        # Attempt to clean any string fields
+        if isinstance(data, dict):
+            cleaned_data = {k: clean_branding(str(v), command) if isinstance(v, str) else v for k, v in data.items()}
+        elif isinstance(data, list):
+            cleaned_data = [clean_branding(str(item), command) if isinstance(item, str) else item for item in data]
+        else:
+            cleaned_data = clean_branding(str(data), command)
+    else:
+        cleaned_data = {"error": "No response from API"}
+    result_text = format_result(cleaned_data, command)
+    await message.reply(result_text, reply_markup=get_result_keyboard(), parse_mode=ParseMode.HTML)
+    await log_lookup(command, message.from_user.id, arg, cleaned_data)
+
+# Register all OSINT commands
+@dp.message(Command("num"))
+async def cmd_num(message: Message, command: CommandObject):
+    await handle_osint_command(message, "num", command.args)
+
+@dp.message(Command("tg2num"))
+async def cmd_tg2num(message: Message, command: CommandObject):
+    await handle_osint_command(message, "tg2num", command.args)
+
+@dp.message(Command("vehicle"))
+async def cmd_vehicle(message: Message, command: CommandObject):
+    await handle_osint_command(message, "vehicle", command.args)
+
+@dp.message(Command("vchalan"))
+async def cmd_vchalan(message: Message, command: CommandObject):
+    await handle_osint_command(message, "vchalan", command.args)
+
+@dp.message(Command("ip"))
+async def cmd_ip(message: Message, command: CommandObject):
+    await handle_osint_command(message, "ip", command.args)
+
+@dp.message(Command("email"))
+async def cmd_email(message: Message, command: CommandObject):
+    await handle_osint_command(message, "email", command.args)
+
+@dp.message(Command("ffinfo"))
+async def cmd_ffinfo(message: Message, command: CommandObject):
+    await handle_osint_command(message, "ffinfo", command.args)
+
+@dp.message(Command("ffban"))
+async def cmd_ffban(message: Message, command: CommandObject):
+    await handle_osint_command(message, "ffban", command.args)
+
+@dp.message(Command("pin"))
+async def cmd_pin(message: Message, command: CommandObject):
+    await handle_osint_command(message, "pin", command.args)
+
+@dp.message(Command("ifsc"))
+async def cmd_ifsc(message: Message, command: CommandObject):
+    await handle_osint_command(message, "ifsc", command.args)
+
+@dp.message(Command("gst"))
+async def cmd_gst(message: Message, command: CommandObject):
+    await handle_osint_command(message, "gst", command.args)
+
+@dp.message(Command("insta"))
+async def cmd_insta(message: Message, command: CommandObject):
+    await handle_osint_command(message, "insta", command.args)
+
+@dp.message(Command("tginfo"))
+async def cmd_tginfo(message: Message, command: CommandObject):
+    await handle_osint_command(message, "tginfo", command.args)
+
+@dp.message(Command("tginfopro"))
+async def cmd_tginfopro(message: Message, command: CommandObject):
+    await handle_osint_command(message, "tginfopro", command.args)
+
+@dp.message(Command("git"))
+async def cmd_git(message: Message, command: CommandObject):
+    await handle_osint_command(message, "git", command.args)
+
+@dp.message(Command("pak"))
+async def cmd_pak(message: Message, command: CommandObject):
+    await handle_osint_command(message, "pak", command.args)
+
+# -------------------------------------------------------------------
+# Admin commands
+# -------------------------------------------------------------------
+
+async def admin_only(message: Message) -> bool:
+    if not await is_admin(message.from_user.id):
+        await message.reply("Unauthorized.")
+        return False
+    return True
+
+@dp.message(Command("addadmin"))
+async def cmd_addadmin(message: Message, command: CommandObject):
+    if not is_owner(message.from_user.id):
+        await message.reply("Owner only.")
+        return
+    if not command.args:
+        await message.reply("Usage: /addadmin <user_id>")
+        return
+    try:
+        user_id = int(command.args.strip())
+    except:
+        await message.reply("Invalid user ID.")
+        return
+    async with db.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (user_id,)) as cursor:
+        await db.commit()
+    await message.reply(f"Admin {user_id} added.")
+
+@dp.message(Command("removeadmin"))
+async def cmd_removeadmin(message: Message, command: CommandObject):
+    if not is_owner(message.from_user.id):
+        await message.reply("Owner only.")
+        return
+    if not command.args:
+        await message.reply("Usage: /removeadmin <user_id>")
+        return
+    try:
+        user_id = int(command.args.strip())
+    except:
+        await message.reply("Invalid user ID.")
+        return
+    async with db.execute("DELETE FROM admins WHERE user_id = ?", (user_id,)) as cursor:
+        await db.commit()
+    await message.reply(f"Admin {user_id} removed.")
+
+@dp.message(Command("listadmins"))
+async def cmd_listadmins(message: Message):
+    if not await admin_only(message):
+        return
+    async with db.execute("SELECT user_id FROM admins") as cursor:
+        rows = await cursor.fetchall()
+    admin_list = "\n".join(str(r[0]) for r in rows)
+    await message.reply(f"Admins:\n{admin_list}")
+
+@dp.message(Command("ban"))
+async def cmd_ban(message: Message, command: CommandObject):
+    if not await admin_only(message):
+        return
+    if not command.args:
+        await message.reply("Usage: /ban <user_id>")
+        return
+    try:
+        user_id = int(command.args.strip())
+    except:
+        await message.reply("Invalid user ID.")
+        return
+    async with db.execute("INSERT OR IGNORE INTO banned (user_id) VALUES (?)", (user_id,)) as cursor:
+        await db.commit()
+    await message.reply(f"User {user_id} banned.")
+
+@dp.message(Command("unban"))
+async def cmd_unban(message: Message, command: CommandObject):
+    if not await admin_only(message):
+        return
+    if not command.args:
+        await message.reply("Usage: /unban <user_id>")
+        return
+    try:
+        user_id = int(command.args.strip())
+    except:
+        await message.reply("Invalid user ID.")
+        return
+    async with db.execute("DELETE FROM banned WHERE user_id = ?", (user_id,)) as cursor:
+        await db.commit()
+    await message.reply(f"User {user_id} unbanned.")
+
+@dp.message(Command("deleteuser"))
+async def cmd_deleteuser(message: Message, command: CommandObject):
+    if not await admin_only(message):
+        return
+    if not command.args:
+        await message.reply("Usage: /deleteuser <user_id>")
+        return
+    try:
+        user_id = int(command.args.strip())
+    except:
+        await message.reply("Invalid user ID.")
+        return
+    async with db.execute("DELETE FROM users WHERE user_id = ?", (user_id,)) as cursor:
+        await db.commit()
+    await message.reply(f"User {user_id} deleted from database.")
+
+@dp.message(Command("searchuser"))
+async def cmd_searchuser(message: Message, command: CommandObject):
+    if not await admin_only(message):
+        return
+    if not command.args:
+        await message.reply("Usage: /searchuser <user_id or username>")
+        return
+    query = command.args.strip()
+    if query.isdigit():
+        async with db.execute("SELECT * FROM users WHERE user_id = ?", (int(query),)) as cursor:
+            row = await cursor.fetchone()
+    else:
+        async with db.execute("SELECT * FROM users WHERE username LIKE ?", (f"%{query}%",)) as cursor:
+            row = await cursor.fetchone()
+    if row:
+        await message.reply(f"User: {row}")
+    else:
+        await message.reply("Not found.")
+
+@dp.message(Command("users"))
+async def cmd_users(message: Message):
+    if not await admin_only(message):
+        return
+    async with db.execute("SELECT COUNT(*) FROM users") as cursor:
+        count = (await cursor.fetchone())[0]
+    await message.reply(f"Total users: {count}")
+
+@dp.message(Command("recentusers"))
+async def cmd_recentusers(message: Message):
+    if not await admin_only(message):
+        return
+    async with db.execute("SELECT user_id, last_seen FROM users ORDER BY last_seen DESC LIMIT 10") as cursor:
+        rows = await cursor.fetchall()
+    text = "\n".join(f"{r[0]} - {r[1]}" for r in rows)
+    await message.reply(f"Recent users:\n{text}")
+
+@dp.message(Command("userlookups"))
+async def cmd_userlookups(message: Message, command: CommandObject):
+    if not await admin_only(message):
+        return
+    if not command.args:
+        await message.reply("Usage: /userlookups <user_id>")
+        return
+    try:
+        user_id = int(command.args.strip())
+    except:
+        await message.reply("Invalid user ID.")
+        return
+    async with db.execute("SELECT command, query, timestamp FROM lookups WHERE user_id = ? ORDER BY timestamp DESC LIMIT 20", (user_id,)) as cursor:
+        rows = await cursor.fetchall()
+    if not rows:
+        await message.reply("No lookups.")
+        return
+    text = "\n".join(f"{r[2]}: /{r[0]} {r[1]}" for r in rows)
+    await message.reply(text[:4000])
+
+@dp.message(Command("leaderboard"))
+async def cmd_leaderboard(message: Message):
+    if not await admin_only(message):
+        return
+    async with db.execute("SELECT user_id, total_lookups FROM users ORDER BY total_lookups DESC LIMIT 10") as cursor:
+        rows = await cursor.fetchall()
+    text = "\n".join(f"{r[0]} - {r[1]} lookups" for r in rows)
+    await message.reply(f"Leaderboard:\n{text}")
+
+@dp.message(Command("inactiveusers"))
+async def cmd_inactiveusers(message: Message):
+    if not await admin_only(message):
+        return
+    # Inactive: last_seen > 30 days ago
+    cutoff = (datetime.utcnow() - timedelta(days=30)).isoformat()
+    async with db.execute("SELECT user_id FROM users WHERE last_seen < ?", (cutoff,)) as cursor:
+        rows = await cursor.fetchall()
+    count = len(rows)
+    await message.reply(f"Inactive users (30 days): {count}")
+
+@dp.message(Command("stats"))
+async def cmd_stats(message: Message):
+    if not await admin_only(message):
+        return
+    async with db.execute("SELECT COUNT(*) FROM users") as cursor:
+        total_users = (await cursor.fetchone())[0]
+    async with db.execute("SELECT COUNT(*) FROM lookups") as cursor:
+        total_lookups = (await cursor.fetchone())[0]
+    await message.reply(f"Total users: {total_users}\nTotal lookups: {total_lookups}")
+
+@dp.message(Command("dailystats"))
+async def cmd_dailystats(message: Message):
+    if not await admin_only(message):
+        return
+    today = date.today().isoformat()
+    async with db.execute("SELECT command, count FROM daily_stats WHERE date = ?", (today,)) as cursor:
+        rows = await cursor.fetchall()
+    if not rows:
+        await message.reply("No stats today.")
+        return
+    text = "\n".join(f"/{r[0]}: {r[1]}" for r in rows)
+    await message.reply(f"Today's stats:\n{text}")
+
+@dp.message(Command("lookupstats"))
+async def cmd_lookupstats(message: Message):
+    if not await admin_only(message):
+        return
+    async with db.execute("SELECT command, COUNT(*) FROM lookups GROUP BY command ORDER BY COUNT(*) DESC") as cursor:
+        rows = await cursor.fetchall()
+    text = "\n".join(f"/{r[0]}: {r[1]}" for r in rows)
+    await message.reply(f"Lookup stats:\n{text}")
+
+@dp.message(Command("settings"))
+async def cmd_settings(message: Message):
+    if not is_owner(message.from_user.id):
+        return
+    # Dummy settings, could be extended
+    await message.reply("Settings: not implemented.")
+
+@dp.message(Command("fulldbbackup"))
+async def cmd_fulldbbackup(message: Message):
+    if not is_owner(message.from_user.id):
+        return
+    # Send database file
+    try:
+        with open("bot_database.sqlite", "rb") as f:
+            await message.reply_document(f, caption="Database backup")
+    except Exception as e:
+        await message.reply(f"Backup failed: {e}")
+
+# -------------------------------------------------------------------
+# Broadcast and DM commands (async tasks)
+# -------------------------------------------------------------------
+
+async def broadcast_task(admin_msg: Message, users: List[int], media: Optional[types.Message] = None):
+    """Send broadcast to list of users."""
+    sent = 0
+    failed = 0
+    for uid in users:
+        try:
+            if media:
+                if media.photo:
+                    await bot.send_photo(uid, media.photo[-1].file_id, caption=media.caption)
+                elif media.video:
+                    await bot.send_video(uid, media.video.file_id, caption=media.caption)
+                elif media.document:
+                    await bot.send_document(uid, media.document.file_id, caption=media.caption)
+                elif media.voice:
+                    await bot.send_voice(uid, media.voice.file_id, caption=media.caption)
+                elif media.text:
+                    await bot.send_message(uid, media.text)
+            else:
+                await bot.send_message(uid, admin_msg.text.split(maxsplit=1)[1] if admin_msg.text else "Broadcast")
+            sent += 1
+        except Exception as e:
             failed += 1
-    await update.message.reply_text(f"✅ परिणाम: सफल: {success}, असफल: {failed}")
+        await asyncio.sleep(0.05)  # avoid flood
+    await admin_msg.reply(f"Broadcast finished. Sent: {sent}, Failed: {failed}")
 
-@admin_only
-async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("उपयोग: /ban user_id")
+@dp.message(Command("broadcast"))
+async def cmd_broadcast(message: Message):
+    if not await admin_only(message):
         return
-    try:
-        user_id = int(context.args[0])
-        db.ban_user(user_id)
-        await update.message.reply_text(f"✅ यूजर {user_id} को बैन कर दिया गया।")
-    except Exception as e:
-        await update.message.reply_text(f"❌ त्रुटि: {e}")
-
-@admin_only
-async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("उपयोग: /unban user_id")
-        return
-    try:
-        user_id = int(context.args[0])
-        db.unban_user(user_id)
-        await update.message.reply_text(f"✅ यूजर {user_id} का बैन हटा दिया गया।")
-    except Exception as e:
-        await update.message.reply_text(f"❌ त्रुटि: {e}")
-
-@admin_only
-async def deleteuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("उपयोग: /deleteuser user_id")
-        return
-    try:
-        user_id = int(context.args[0])
-        db.delete_user(user_id)
-        await update.message.reply_text(f"✅ यूजर {user_id} डेटाबेस से हटा दिया गया।")
-    except Exception as e:
-        await update.message.reply_text(f"❌ त्रुटि: {e}")
-
-@admin_only
-async def searchuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("उपयोग: /searchuser क्वेरी")
-        return
-    query = " ".join(context.args)
-    users = db.search_users(query)
+    # Get all user ids
+    async with db.execute("SELECT user_id FROM users") as cursor:
+        rows = await cursor.fetchall()
+    users = [r[0] for r in rows]
     if not users:
-        await update.message.reply_text("कोई यूजर नहीं मिला।")
+        await message.reply("No users.")
         return
-    text = "🔍 **खोज परिणाम:**\n"
-    for u in users:
-        text += f"👤 {u[1]} ({u[2]}) | ID: `{u[0]}` | बैन: {u[5]} | एडमिन: {u[6]}\n"
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-
-@admin_only
-async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    page = 1
-    if context.args and context.args[0].isdigit():
-        page = int(context.args[0])
-    limit = 10
-    offset = (page - 1) * limit
-    users = db.get_all_users(limit=limit, offset=offset)
-    total = db.count_users()
-    if not users:
-        await update.message.reply_text("कोई यूजर नहीं।")
-        return
-    text = f"👥 **यूजर्स (पेज {page})** - कुल: {total}\n"
-    for u in users:
-        text += f"👤 {u[2]} (@{u[1]}) | ID: `{u[0]}` | जॉइन: {u[4][:10]}\n"
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-
-@admin_only
-async def recentusers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    days = 7
-    if context.args and context.args[0].isdigit():
-        days = int(context.args[0])
-    users = db.get_recent_users(days)
-    text = f"📅 **पिछले {days} दिनों में नए यूजर्स:** {len(users)}\n"
-    for u in users[:10]:
-        text += f"👤 {u[2]} (@{u[1]}) | {u[4][:10]}\n"
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-
-@admin_only
-async def userlookups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("उपयोग: /userlookups user_id")
-        return
-    try:
-        user_id = int(context.args[0])
-        logs = db.get_user_logs(user_id, limit=10)
-        if not logs:
-            await update.message.reply_text("इस यूजर का कोई लॉग नहीं।")
+    # If replying to a media, broadcast that media
+    if message.reply_to_message:
+        media_msg = message.reply_to_message
+        asyncio.create_task(broadcast_task(message, users, media_msg))
+        await message.reply(f"Broadcasting media to {len(users)} users...")
+    else:
+        if len(message.text.split()) < 2:
+            await message.reply("Usage: /broadcast <text> or reply to media")
             return
-        text = f"📋 **यूजर {user_id} के हालिया लुकअप:**\n"
-        for log in logs:
-            text += f"• {log[2]} ({log[3][:19]}) - {log[4][:50]}\n"
-        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-    except Exception as e:
-        await update.message.reply_text(f"❌ त्रुटि: {e}")
+        asyncio.create_task(broadcast_task(message, users))
+        await message.reply(f"Broadcasting text to {len(users)} users...")
 
-@admin_only
-async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # सबसे ज्यादा लुकअप करने वाले यूजर्स
-    conn = sqlite3.connect(db.DB_FILE)
-    c = conn.cursor()
-    c.execute('''SELECT user_id, COUNT(*) as cnt FROM logs GROUP BY user_id ORDER BY cnt DESC LIMIT 10''')
-    top = c.fetchall()
-    conn.close()
-    if not top:
-        await update.message.reply_text("कोई डेटा नहीं।")
+@dp.message(Command("dm"))
+async def cmd_dm(message: Message, command: CommandObject):
+    if not await admin_only(message):
         return
-    text = "🏆 **टॉप 10 यूजर्स (लुकअप काउंट):**\n"
-    for i, (uid, cnt) in enumerate(top, 1):
-        text += f"{i}. `{uid}` - {cnt} लुकअप\n"
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-
-@admin_only
-async def inactiveusers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    days = 30
-    if context.args and context.args[0].isdigit():
-        days = int(context.args[0])
-    users = db.get_inactive_users(days)
-    text = f"⏰ **{days} दिनों से निष्क्रिय यूजर्स:** {len(users)}\n"
-    for u in users[:10]:
-        text += f"👤 {u[2]} (@{u[1]}) | आखिरी जॉइन: {u[4][:10]}\n"
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-
-# Statistics commands
-@admin_only
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    total_users, total_banned, total_admins, total_logs = db.get_stats()
-    text = (
-        f"📊 **बॉट सांख्यिकी:**\n"
-        f"👥 कुल यूजर्स: {total_users}\n"
-        f"🚫 बैन यूजर्स: {total_banned}\n"
-        f"👑 एडमिन: {total_admins}\n"
-        f"📝 कुल लुकअप: {total_logs}\n"
-    )
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-
-@admin_only
-async def dailystats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    days = 7
-    if context.args and context.args[0].isdigit():
-        days = int(context.args[0])
-    stats = db.get_daily_stats(days)
-    if not stats:
-        await update.message.reply_text("कोई डेटा नहीं।")
+    args = command.args
+    if not args:
+        await message.reply("Usage: /dm user_id text")
         return
-    text = f"📅 **पिछले {days} दिनों के लुकअप:**\n"
-    for date, cnt in stats:
-        text += f"{date}: {cnt} लुकअप\n"
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-
-@admin_only
-async def lookupstats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    stats = db.get_lookup_stats()
-    if not stats:
-        await update.message.reply_text("कोई डेटा नहीं।")
-        return
-    text = "🔍 **लुकअप कमांड स्टैटिस्टिक्स:**\n"
-    for cmd, cnt in stats:
-        text += f"/{cmd}: {cnt} बार\n"
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-
-@admin_only
-async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """डेटा का बैकअप CSV के रूप में भेजें।"""
-    csv_data = db.backup_to_csv()
-    await update.message.reply_document(
-        document=io.BytesIO(csv_data.encode()),
-        filename=f"users_backup_{datetime.now().strftime('%Y%m%d')}.csv"
-    )
-
-@admin_only
-async def topref_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    limit = 10
-    if context.args and context.args[0].isdigit():
-        limit = int(context.args[0])
-    top = db.get_top_referrers(limit)
-    if not top:
-        await update.message.reply_text("कोई रेफरल नहीं।")
-        return
-    text = f"🏆 **टॉप {limit} रेफरल देने वाले:**\n"
-    for ref_id, cnt in top:
-        user = db.get_user(ref_id)
-        name = user[2] if user else str(ref_id)
-        text += f"👤 {name} (ID: {ref_id}) - {cnt} रेफरल\n"
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-
-# Owner commands
-@admin_only
-async def addadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("केवल ओनर ही एडमिन जोड़ सकता है।")
-        return
-    if not context.args:
-        await update.message.reply_text("उपयोग: /addadmin user_id")
+    parts = args.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.reply("Usage: /dm user_id text")
         return
     try:
-        user_id = int(context.args[0])
-        db.add_admin(user_id)
-        await update.message.reply_text(f"✅ यूजर {user_id} को एडमिन बना दिया गया।")
-    except Exception as e:
-        await update.message.reply_text(f"❌ त्रुटि: {e}")
-
-@admin_only
-async def removeadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("केवल ओनर ही एडमिन हटा सकता है।")
+        uid = int(parts[0])
+    except:
+        await message.reply("Invalid user ID.")
         return
-    if not context.args:
-        await update.message.reply_text("उपयोग: /removeadmin user_id")
-        return
+    text = parts[1]
     try:
-        user_id = int(context.args[0])
-        db.remove_admin(user_id)
-        await update.message.reply_text(f"✅ यूजर {user_id} से एडमिन हटा दिया गया।")
+        await bot.send_message(uid, text)
+        await message.reply(f"Message sent to {uid}.")
     except Exception as e:
-        await update.message.reply_text(f"❌ त्रुटि: {e}")
+        await message.reply(f"Failed: {e}")
 
-@admin_only
-async def listadmins_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    admins = db.list_admins()
-    if not admins:
-        await update.message.reply_text("कोई एडमिन नहीं।")
+@dp.message(Command("bulkdm"))
+async def cmd_bulkdm(message: Message, command: CommandObject):
+    if not await admin_only(message):
         return
-    text = "👑 **एडमिन लिस्ट:**\n"
-    for uid, uname in admins:
-        text += f"• {uname} (ID: `{uid}`)\n"
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-
-@admin_only
-async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # बेसिक सेटिंग्स दिखाएँ
-    text = (
-        "⚙️ **बॉट सेटिंग्स:**\n"
-        f"• ओनर ID: `{OWNER_ID}`\n"
-        f"• एडमिन IDs: {', '.join(map(str, ADMIN_IDS))}\n"
-        f"• फोर्स चैनल: {', '.join([c['link'] for c in FORCE_CHANNELS])}\n"
-    )
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-
-@admin_only
-async def fulldbbackup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # डेटाबेस फाइल (.db) और CSV भेजें
-    if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("केवल ओनर ही फुल बैकअप ले सकता है।")
+    args = command.args
+    if not args:
+        await message.reply("Usage: /bulkdm id1 id2 ... text")
         return
-    # .db file
-    with open(db.DB_FILE, 'rb') as f:
-        await update.message.reply_document(document=f, filename=db.DB_FILE)
-    # CSV
-    csv_data = db.backup_to_csv()
-    await update.message.reply_document(
-        document=io.BytesIO(csv_data.encode()),
-        filename=f"users_backup_{datetime.now().strftime('%Y%m%d')}.csv"
-    )
-    # Google Sheets link (आपके दिए गए लिंक से)
-    await update.message.reply_text(
-        "📊 Google Sheets बैकअप:\n"
-        "https://docs.google.com/spreadsheets/d/174-LvA9PGzz2tp-ZLbBjbyCiMUPp2ZY7iXci4foQjVo/edit?usp=sharing"
-    )
+    parts = args.split()
+    # Last part is text, rest are ids
+    if len(parts) < 2:
+        await message.reply("Usage: /bulkdm id1 id2 ... text")
+        return
+    ids_text = parts[:-1]
+    text = parts[-1]
+    ids = []
+    for p in ids_text:
+        try:
+            ids.append(int(p))
+        except:
+            await message.reply(f"Invalid ID: {p}")
+            return
+    asyncio.create_task(broadcast_task(message, ids, None))
+    await message.reply(f"Sending DM to {len(ids)} users...")
 
-# ================== बॉट सेटअप और थ्रेड ==================
+# -------------------------------------------------------------------
+# Callback handlers
+# -------------------------------------------------------------------
 
-def run_bot():
-    app = Application.builder().token(BOT_TOKEN).build()
+@dp.callback_query(F.data == "check_join")
+async def callback_check_join(callback: CallbackQuery):
+    if await check_force_join(callback.from_user.id):
+        await callback.message.edit_text("✅ You have joined both channels. You can now use the bot.")
+        await callback.answer()
+    else:
+        await callback.answer("Still missing one or both channels.", show_alert=True)
 
-    # OSINT कमांड्स
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("num", num_command))
-    app.add_handler(CommandHandler("tg2num", tg2num_command))
-    app.add_handler(CommandHandler("vehicle", vehicle_command))
-    app.add_handler(CommandHandler("vchalan", vchalan_command))
-    app.add_handler(CommandHandler("ip", ip_command))
-    app.add_handler(CommandHandler("email", email_command))
-    app.add_handler(CommandHandler("ffinfo", ffinfo_command))
-    app.add_handler(CommandHandler("ffban", ffban_command))
-    app.add_handler(CommandHandler("pin", pin_command))
-    app.add_handler(CommandHandler("ifsc", ifsc_command))
-    app.add_handler(CommandHandler("gst", gst_command))
-    app.add_handler(CommandHandler("insta", insta_command))
-    app.add_handler(CommandHandler("tginfo", tginfo_command))
-    app.add_handler(CommandHandler("tginfopro", tginfopro_command))
-    app.add_handler(CommandHandler("git", git_command))
-    app.add_handler(CommandHandler("pak", pak_command))
+@dp.callback_query(F.data == "copy")
+async def callback_copy(callback: CallbackQuery):
+    await callback.answer("Tap and copy the text above.", show_alert=False)
 
-    # एडमिन कमांड्स
-    app.add_handler(CommandHandler("broadcast", broadcast_command))
-    app.add_handler(CommandHandler("dm", dm_command))
-    app.add_handler(CommandHandler("bulkdm", bulkdm_command))
-    app.add_handler(CommandHandler("ban", ban_command))
-    app.add_handler(CommandHandler("unban", unban_command))
-    app.add_handler(CommandHandler("deleteuser", deleteuser_command))
-    app.add_handler(CommandHandler("searchuser", searchuser_command))
-    app.add_handler(CommandHandler("users", users_command))
-    app.add_handler(CommandHandler("recentusers", recentusers_command))
-    app.add_handler(CommandHandler("userlookups", userlookups_command))
-    app.add_handler(CommandHandler("leaderboard", leaderboard_command))
-    app.add_handler(CommandHandler("inactiveusers", inactiveusers_command))
-    app.add_handler(CommandHandler("stats", stats_command))
-    app.add_handler(CommandHandler("dailystats", dailystats_command))
-    app.add_handler(CommandHandler("lookupstats", lookupstats_command))
-    app.add_handler(CommandHandler("backup", backup_command))
-    app.add_handler(CommandHandler("topref", topref_command))
-    app.add_handler(CommandHandler("addadmin", addadmin_command))
-    app.add_handler(CommandHandler("removeadmin", removeadmin_command))
-    app.add_handler(CommandHandler("listadmins", listadmins_command))
-    app.add_handler(CommandHandler("settings", settings_command))
-    app.add_handler(CommandHandler("fulldbbackup", fulldbbackup_command))
+# -------------------------------------------------------------------
+# Self-ping task to keep Render dyno alive
+# -------------------------------------------------------------------
 
-    # कॉलबैक हैंडलर
-    app.add_handler(CallbackQueryHandler(button_callback))
+async def self_ping_task_func(base_url: str):
+    """Periodically ping the health endpoint to prevent sleeping."""
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(base_url, timeout=10) as resp:
+                    logger.info(f"Self-ping to {base_url} returned {resp.status}")
+        except Exception as e:
+            logger.error(f"Self-ping failed: {e}")
+        await asyncio.sleep(600)  # 10 minutes
 
-    logger.info("बॉट पोलिंग शुरू...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+# -------------------------------------------------------------------
+# Error handler
+# -------------------------------------------------------------------
+
+@dp.errors()
+async def errors_handler(event: aiogram.types.ErrorEvent):
+    logger.error(f"Bot error: {event.exception}", exc_info=True)
+
+# -------------------------------------------------------------------
+# Webhook setup and aiohttp app
+# -------------------------------------------------------------------
+
+async def on_startup():
+    global db, self_ping_task
+    # Initialize database
+    db = await Database.create("bot_database.sqlite")
+    await db.init_db()
+    # Set webhook
+    webhook_url = os.getenv("WEBHOOK_URL")
+    if not webhook_url:
+        logger.error("WEBHOOK_URL not set")
+        return
+    await bot.set_webhook(url=webhook_url, drop_pending_updates=True)
+    logger.info(f"Webhook set to {webhook_url}")
+    # Start self-ping task (extract base URL from webhook)
+    base_url = webhook_url.split('/webhook/')[0]  # Gets https://example.com
+    if base_url:
+        self_ping_task = asyncio.create_task(self_ping_task_func(base_url))
+        logger.info(f"Self-ping task started, pinging {base_url} every 10 minutes")
+
+async def on_shutdown():
+    # Delete webhook
+    await bot.delete_webhook()
+    # Cancel self-ping task
+    if self_ping_task:
+        self_ping_task.cancel()
+    await db.close()
+    logger.info("Webhook deleted, self-ping stopped, and DB closed")
+
+async def handle_webhook(request: web.Request) -> web.Response:
+    """Handle incoming Telegram update."""
+    try:
+        update = types.Update.model_validate(await request.json(), context={"bot": bot})
+        await dp.feed_update(bot, update)
+        return web.Response()
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+        return web.Response(status=500)
+
+async def health_check(request: web.Request) -> web.Response:
+    return web.Response(text="Bot running")
+
+def create_app():
+    app = web.Application()
+    app.router.add_post(f"/webhook/{BOT_TOKEN}", handle_webhook)
+    app.router.add_get("/", health_check)
+    app.on_startup.append(lambda _: on_startup())
+    app.on_shutdown.append(lambda _: on_shutdown())
+    return app
 
 if __name__ == "__main__":
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
-    bot_thread.start()
-
-    port = int(os.environ.get("PORT", 10000))
-    flask_app.run(host="0.0.0.0", port=port)
+    port = int(os.environ.get("PORT", 8080))
+    web.run_app(create_app(), host="0.0.0.0", port=port)
