@@ -1,4 +1,3 @@
-# main.py
 import os
 import sys
 import json
@@ -6,8 +5,8 @@ import asyncio
 import logging
 import re
 from datetime import datetime, date, timedelta
-from typing import Dict, List, Optional, Any
-from contextlib import asynccontextmanager
+from typing import List, Optional, Any
+from urllib.parse import urlparse
 
 import aiohttp
 from aiohttp import web
@@ -17,10 +16,7 @@ from aiogram.enums import ParseMode, ChatMemberStatus
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.exceptions import (
-    TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter,
-    TelegramAPIError
-)
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 import aiosqlite
 from dotenv import load_dotenv
 
@@ -55,7 +51,7 @@ LOG_CHANNELS = {
     "chalan": -1003237155636,
     "tg_to_info": -1003643170105,
     "tgpro": -1003643170105,
-    "adr": -1003482423742,          # <-- Aadhaar log channel (same as num)
+    "adr": -1003482423742,
 }
 BRANDING_BLOCKLIST = [
     "@patelkrish_99", "patelkrish_99", "t.me/anshapi", "anshapi", "@Kon_Hu_Mai", "Dm to buy access", "Kon_Hu_Mai"
@@ -80,7 +76,7 @@ API_ENDPOINTS = {
     "tginfopro": "https://api.b77bf911.workers.dev/telegram?user={}",
     "git": "https://abbas-apis.vercel.app/api/github?username={}",
     "pak": "https://abbas-apis.vercel.app/api/pakistan?number={}",
-    "adr": "https://api-ij32.onrender.com/aadhar?match={}",   # <-- Aadhaar API endpoint
+    "adr": "https://api-ij32.onrender.com/aadhar?match={}",
 }
 
 # Initialize bot and dispatcher
@@ -92,7 +88,7 @@ if not BOT_TOKEN:
 bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 
-# Database import (from database.py)
+# Database import
 from database import Database
 
 # Global database instance
@@ -114,7 +110,6 @@ def clean_branding(text: str, command: str = None) -> str:
         blocklist.extend(EXTRA_NUMBER_BLOCK)
     for phrase in blocklist:
         text = text.replace(phrase, "")
-    # Also remove extra whitespace caused by removal
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
@@ -161,9 +156,9 @@ def get_result_keyboard() -> InlineKeyboardMarkup:
 async def check_force_join(user_id: int) -> bool:
     """Check if user joined both required channels. Admins bypass."""
     # Check if admin
-    async with db.execute("SELECT user_id FROM admins WHERE user_id = ?", (user_id,)) as cursor:
-        if await cursor.fetchone():
-            return True
+    cursor = await db.execute("SELECT user_id FROM admins WHERE user_id = ?", (user_id,))
+    if await cursor.fetchone():
+        return True
     for channel in FORCE_JOIN_CHANNELS:
         try:
             member = await bot.get_chat_member(chat_id=channel["id"], user_id=user_id)
@@ -171,7 +166,6 @@ async def check_force_join(user_id: int) -> bool:
                 return False
         except (TelegramBadRequest, TelegramForbiddenError) as e:
             logger.warning(f"Force join check failed for {user_id} in {channel['id']}: {e}")
-            # If channel inaccessible, treat as not joined
             return False
     return True
 
@@ -193,7 +187,6 @@ async def log_lookup(command: str, user_id: int, query: str, result: Any):
         return
     try:
         log_text = f"User: {user_id}\nQuery: {query}\nResult: {json.dumps(result, indent=2, ensure_ascii=False)}"
-        # Telegram message limit ~4096, split if needed
         if len(log_text) > 4000:
             log_text = log_text[:4000] + "..."
         await bot.send_message(log_channel, log_text)
@@ -203,43 +196,38 @@ async def log_lookup(command: str, user_id: int, query: str, result: Any):
 async def ensure_user_in_db(user_id: int, username: str = None, first_name: str = None):
     """Insert or update user in database."""
     now = datetime.utcnow().isoformat()
-    async with db.execute(
+    await db.execute(
         "INSERT OR IGNORE INTO users (user_id, username, first_name, first_seen, last_seen, total_lookups) VALUES (?, ?, ?, ?, ?, 0)",
         (user_id, username, first_name, now, now)
-    ) as cursor:
-        pass
-    async with db.execute(
+    )
+    await db.execute(
         "UPDATE users SET last_seen = ?, username = ?, first_name = ? WHERE user_id = ?",
         (now, username, first_name, user_id)
-    ) as cursor:
-        pass
+    )
     await db.commit()
 
 async def increment_lookups(user_id: int):
-    async with db.execute(
+    await db.execute(
         "UPDATE users SET total_lookups = total_lookups + 1 WHERE user_id = ?",
         (user_id,)
-    ) as cursor:
-        pass
+    )
     await db.commit()
 
 async def update_daily_stats(command: str):
     today = date.today().isoformat()
-    async with db.execute(
+    await db.execute(
         "INSERT INTO daily_stats (date, command, count) VALUES (?, ?, 1) ON CONFLICT(date, command) DO UPDATE SET count = count + 1",
         (today, command)
-    ) as cursor:
-        pass
+    )
     await db.commit()
 
 async def log_lookup_to_db(user_id: int, command: str, query: str):
     """Store lookup in database (for stats and history)."""
     now = datetime.utcnow().isoformat()
-    async with db.execute(
+    await db.execute(
         "INSERT INTO lookups (user_id, command, query, timestamp) VALUES (?, ?, ?, ?)",
         (user_id, command, query, now)
-    ) as cursor:
-        pass
+    )
     await db.commit()
 
 # -------------------------------------------------------------------
@@ -252,26 +240,23 @@ def is_owner(user_id: int) -> bool:
 async def is_admin(user_id: int) -> bool:
     if is_owner(user_id):
         return True
-    async with db.execute("SELECT user_id FROM admins WHERE user_id = ?", (user_id,)) as cursor:
-        return await cursor.fetchone() is not None
+    cursor = await db.execute("SELECT user_id FROM admins WHERE user_id = ?", (user_id,))
+    return await cursor.fetchone() is not None
 
 async def is_banned(user_id: int) -> bool:
-    async with db.execute("SELECT user_id FROM banned WHERE user_id = ?", (user_id,)) as cursor:
-        return await cursor.fetchone() is not None
+    cursor = await db.execute("SELECT user_id FROM banned WHERE user_id = ?", (user_id,))
+    return await cursor.fetchone() is not None
 
 async def check_group_and_join(message: Message) -> bool:
     """Verify that message is in group and user has joined channels."""
     if message.chat.type not in ["group", "supergroup"]:
-        # Private chat: allow only if owner/admin
         if await is_admin(message.from_user.id):
             return True
         await message.reply("Ye bot sirf group me kaam karta hai.\nPersonal use ke liye use kare: @osintfatherNullBot")
         return False
-    # Check ban
     if await is_banned(message.from_user.id):
         await message.reply("You are banned.")
         return False
-    # Force join check for non-admins
     if not await is_admin(message.from_user.id):
         if not await check_force_join(message.from_user.id):
             await send_force_join_prompt(message)
@@ -292,12 +277,11 @@ async def handle_osint_command(message: Message, command: str, arg: str):
     await ensure_user_in_db(message.from_user.id, message.from_user.username, message.from_user.first_name)
     await increment_lookups(message.from_user.id)
     await update_daily_stats(command)
-    await log_lookup_to_db(message.from_user.id, command, arg)   # <-- NEW: store in DB
+    await log_lookup_to_db(message.from_user.id, command, arg)
     url = API_ENDPOINTS[command].format(arg)
     data = await fetch_api(url)
     cleaned_data = None
     if data:
-        # Attempt to clean any string fields
         if isinstance(data, dict):
             cleaned_data = {k: clean_branding(str(v), command) if isinstance(v, str) else v for k, v in data.items()}
         elif isinstance(data, list):
@@ -375,13 +359,12 @@ async def cmd_git(message: Message, command: CommandObject):
 async def cmd_pak(message: Message, command: CommandObject):
     await handle_osint_command(message, "pak", command.args)
 
-# ---------- New Aadhaar command ----------
 @dp.message(Command("adr"))
 async def cmd_adr(message: Message, command: CommandObject):
     await handle_osint_command(message, "adr", command.args)
 
 # -------------------------------------------------------------------
-# Admin commands (unchanged, keep as is)
+# Admin commands
 # -------------------------------------------------------------------
 
 async def admin_only(message: Message) -> bool:
@@ -403,8 +386,8 @@ async def cmd_addadmin(message: Message, command: CommandObject):
     except:
         await message.reply("Invalid user ID.")
         return
-    async with db.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (user_id,)) as cursor:
-        await db.commit()
+    await db.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (user_id,))
+    await db.commit()
     await message.reply(f"Admin {user_id} added.")
 
 @dp.message(Command("removeadmin"))
@@ -420,16 +403,16 @@ async def cmd_removeadmin(message: Message, command: CommandObject):
     except:
         await message.reply("Invalid user ID.")
         return
-    async with db.execute("DELETE FROM admins WHERE user_id = ?", (user_id,)) as cursor:
-        await db.commit()
+    await db.execute("DELETE FROM admins WHERE user_id = ?", (user_id,))
+    await db.commit()
     await message.reply(f"Admin {user_id} removed.")
 
 @dp.message(Command("listadmins"))
 async def cmd_listadmins(message: Message):
     if not await admin_only(message):
         return
-    async with db.execute("SELECT user_id FROM admins") as cursor:
-        rows = await cursor.fetchall()
+    cursor = await db.execute("SELECT user_id FROM admins")
+    rows = await cursor.fetchall()
     admin_list = "\n".join(str(r[0]) for r in rows)
     await message.reply(f"Admins:\n{admin_list}")
 
@@ -445,8 +428,8 @@ async def cmd_ban(message: Message, command: CommandObject):
     except:
         await message.reply("Invalid user ID.")
         return
-    async with db.execute("INSERT OR IGNORE INTO banned (user_id) VALUES (?)", (user_id,)) as cursor:
-        await db.commit()
+    await db.execute("INSERT OR IGNORE INTO banned (user_id) VALUES (?)", (user_id,))
+    await db.commit()
     await message.reply(f"User {user_id} banned.")
 
 @dp.message(Command("unban"))
@@ -461,8 +444,8 @@ async def cmd_unban(message: Message, command: CommandObject):
     except:
         await message.reply("Invalid user ID.")
         return
-    async with db.execute("DELETE FROM banned WHERE user_id = ?", (user_id,)) as cursor:
-        await db.commit()
+    await db.execute("DELETE FROM banned WHERE user_id = ?", (user_id,))
+    await db.commit()
     await message.reply(f"User {user_id} unbanned.")
 
 @dp.message(Command("deleteuser"))
@@ -477,8 +460,8 @@ async def cmd_deleteuser(message: Message, command: CommandObject):
     except:
         await message.reply("Invalid user ID.")
         return
-    async with db.execute("DELETE FROM users WHERE user_id = ?", (user_id,)) as cursor:
-        await db.commit()
+    await db.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+    await db.commit()
     await message.reply(f"User {user_id} deleted from database.")
 
 @dp.message(Command("searchuser"))
@@ -490,11 +473,11 @@ async def cmd_searchuser(message: Message, command: CommandObject):
         return
     query = command.args.strip()
     if query.isdigit():
-        async with db.execute("SELECT * FROM users WHERE user_id = ?", (int(query),)) as cursor:
-            row = await cursor.fetchone()
+        cursor = await db.execute("SELECT * FROM users WHERE user_id = ?", (int(query),))
+        row = await cursor.fetchone()
     else:
-        async with db.execute("SELECT * FROM users WHERE username LIKE ?", (f"%{query}%",)) as cursor:
-            row = await cursor.fetchone()
+        cursor = await db.execute("SELECT * FROM users WHERE username LIKE ?", (f"%{query}%",))
+        row = await cursor.fetchone()
     if row:
         await message.reply(f"User: {row}")
     else:
@@ -504,16 +487,16 @@ async def cmd_searchuser(message: Message, command: CommandObject):
 async def cmd_users(message: Message):
     if not await admin_only(message):
         return
-    async with db.execute("SELECT COUNT(*) FROM users") as cursor:
-        count = (await cursor.fetchone())[0]
+    cursor = await db.execute("SELECT COUNT(*) FROM users")
+    count = (await cursor.fetchone())[0]
     await message.reply(f"Total users: {count}")
 
 @dp.message(Command("recentusers"))
 async def cmd_recentusers(message: Message):
     if not await admin_only(message):
         return
-    async with db.execute("SELECT user_id, last_seen FROM users ORDER BY last_seen DESC LIMIT 10") as cursor:
-        rows = await cursor.fetchall()
+    cursor = await db.execute("SELECT user_id, last_seen FROM users ORDER BY last_seen DESC LIMIT 10")
+    rows = await cursor.fetchall()
     text = "\n".join(f"{r[0]} - {r[1]}" for r in rows)
     await message.reply(f"Recent users:\n{text}")
 
@@ -529,8 +512,11 @@ async def cmd_userlookups(message: Message, command: CommandObject):
     except:
         await message.reply("Invalid user ID.")
         return
-    async with db.execute("SELECT command, query, timestamp FROM lookups WHERE user_id = ? ORDER BY timestamp DESC LIMIT 20", (user_id,)) as cursor:
-        rows = await cursor.fetchall()
+    cursor = await db.execute(
+        "SELECT command, query, timestamp FROM lookups WHERE user_id = ? ORDER BY timestamp DESC LIMIT 20",
+        (user_id,)
+    )
+    rows = await cursor.fetchall()
     if not rows:
         await message.reply("No lookups.")
         return
@@ -541,8 +527,8 @@ async def cmd_userlookups(message: Message, command: CommandObject):
 async def cmd_leaderboard(message: Message):
     if not await admin_only(message):
         return
-    async with db.execute("SELECT user_id, total_lookups FROM users ORDER BY total_lookups DESC LIMIT 10") as cursor:
-        rows = await cursor.fetchall()
+    cursor = await db.execute("SELECT user_id, total_lookups FROM users ORDER BY total_lookups DESC LIMIT 10")
+    rows = await cursor.fetchall()
     text = "\n".join(f"{r[0]} - {r[1]} lookups" for r in rows)
     await message.reply(f"Leaderboard:\n{text}")
 
@@ -550,10 +536,9 @@ async def cmd_leaderboard(message: Message):
 async def cmd_inactiveusers(message: Message):
     if not await admin_only(message):
         return
-    # Inactive: last_seen > 30 days ago
     cutoff = (datetime.utcnow() - timedelta(days=30)).isoformat()
-    async with db.execute("SELECT user_id FROM users WHERE last_seen < ?", (cutoff,)) as cursor:
-        rows = await cursor.fetchall()
+    cursor = await db.execute("SELECT user_id FROM users WHERE last_seen < ?", (cutoff,))
+    rows = await cursor.fetchall()
     count = len(rows)
     await message.reply(f"Inactive users (30 days): {count}")
 
@@ -561,10 +546,10 @@ async def cmd_inactiveusers(message: Message):
 async def cmd_stats(message: Message):
     if not await admin_only(message):
         return
-    async with db.execute("SELECT COUNT(*) FROM users") as cursor:
-        total_users = (await cursor.fetchone())[0]
-    async with db.execute("SELECT COUNT(*) FROM lookups") as cursor:
-        total_lookups = (await cursor.fetchone())[0]
+    cursor = await db.execute("SELECT COUNT(*) FROM users")
+    total_users = (await cursor.fetchone())[0]
+    cursor = await db.execute("SELECT COUNT(*) FROM lookups")
+    total_lookups = (await cursor.fetchone())[0]
     await message.reply(f"Total users: {total_users}\nTotal lookups: {total_lookups}")
 
 @dp.message(Command("dailystats"))
@@ -572,8 +557,8 @@ async def cmd_dailystats(message: Message):
     if not await admin_only(message):
         return
     today = date.today().isoformat()
-    async with db.execute("SELECT command, count FROM daily_stats WHERE date = ?", (today,)) as cursor:
-        rows = await cursor.fetchall()
+    cursor = await db.execute("SELECT command, count FROM daily_stats WHERE date = ?", (today,))
+    rows = await cursor.fetchall()
     if not rows:
         await message.reply("No stats today.")
         return
@@ -584,8 +569,8 @@ async def cmd_dailystats(message: Message):
 async def cmd_lookupstats(message: Message):
     if not await admin_only(message):
         return
-    async with db.execute("SELECT command, COUNT(*) FROM lookups GROUP BY command ORDER BY COUNT(*) DESC") as cursor:
-        rows = await cursor.fetchall()
+    cursor = await db.execute("SELECT command, COUNT(*) FROM lookups GROUP BY command ORDER BY COUNT(*) DESC")
+    rows = await cursor.fetchall()
     text = "\n".join(f"/{r[0]}: {r[1]}" for r in rows)
     await message.reply(f"Lookup stats:\n{text}")
 
@@ -593,14 +578,12 @@ async def cmd_lookupstats(message: Message):
 async def cmd_settings(message: Message):
     if not is_owner(message.from_user.id):
         return
-    # Dummy settings, could be extended
     await message.reply("Settings: not implemented.")
 
 @dp.message(Command("fulldbbackup"))
 async def cmd_fulldbbackup(message: Message):
     if not is_owner(message.from_user.id):
         return
-    # Send database file
     db_path = os.getenv("DATABASE_PATH", "bot_database.sqlite")
     try:
         with open(db_path, "rb") as f:
@@ -609,7 +592,7 @@ async def cmd_fulldbbackup(message: Message):
         await message.reply(f"Backup failed: {e}")
 
 # -------------------------------------------------------------------
-# Broadcast and DM commands (async tasks)
+# Broadcast and DM commands
 # -------------------------------------------------------------------
 
 async def broadcast_task(admin_msg: Message, users: List[int], media: Optional[types.Message] = None):
@@ -634,21 +617,19 @@ async def broadcast_task(admin_msg: Message, users: List[int], media: Optional[t
             sent += 1
         except Exception as e:
             failed += 1
-        await asyncio.sleep(0.05)  # avoid flood
+        await asyncio.sleep(0.05)
     await admin_msg.reply(f"Broadcast finished. Sent: {sent}, Failed: {failed}")
 
 @dp.message(Command("broadcast"))
 async def cmd_broadcast(message: Message):
     if not await admin_only(message):
         return
-    # Get all user ids
-    async with db.execute("SELECT user_id FROM users") as cursor:
-        rows = await cursor.fetchall()
+    cursor = await db.execute("SELECT user_id FROM users")
+    rows = await cursor.fetchall()
     users = [r[0] for r in rows]
     if not users:
         await message.reply("No users.")
         return
-    # If replying to a media, broadcast that media
     if message.reply_to_message:
         media_msg = message.reply_to_message
         asyncio.create_task(broadcast_task(message, users, media_msg))
@@ -693,7 +674,6 @@ async def cmd_bulkdm(message: Message, command: CommandObject):
         await message.reply("Usage: /bulkdm id1 id2 ... text")
         return
     parts = args.split()
-    # Last part is text, rest are ids
     if len(parts) < 2:
         await message.reply("Usage: /bulkdm id1 id2 ... text")
         return
@@ -726,7 +706,7 @@ async def callback_copy(callback: CallbackQuery):
     await callback.answer("Tap and copy the text above.", show_alert=False)
 
 # -------------------------------------------------------------------
-# Self-ping task to keep Render dyno alive
+# Self-ping task
 # -------------------------------------------------------------------
 
 async def self_ping_task_func(base_url: str):
@@ -744,7 +724,7 @@ async def self_ping_task_func(base_url: str):
 # Error handler
 # -------------------------------------------------------------------
 
-@dp.errors()
+@dp.error()
 async def errors_handler(event: aiogram.types.ErrorEvent):
     logger.error(f"Bot error: {event.exception}", exc_info=True)
 
@@ -754,8 +734,9 @@ async def errors_handler(event: aiogram.types.ErrorEvent):
 
 async def on_startup():
     global db, self_ping_task
-    # Use persistent disk path if set
+    # Ensure directory for database exists
     db_path = os.getenv("DATABASE_PATH", "bot_database.sqlite")
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
     db = await Database.create(db_path)
     await db.init_db()
     # Set webhook
@@ -765,8 +746,9 @@ async def on_startup():
         return
     await bot.set_webhook(url=webhook_url, drop_pending_updates=True)
     logger.info(f"Webhook set to {webhook_url}")
-    # Start self-ping task (extract base URL from webhook)
-    base_url = webhook_url.split('/webhook/')[0]  # Gets https://example.com
+    # Start self-ping task using base domain
+    parsed = urlparse(webhook_url)
+    base_url = f"{parsed.scheme}://{parsed.netloc}"
     if base_url:
         self_ping_task = asyncio.create_task(self_ping_task_func(base_url))
         logger.info(f"Self-ping task started, pinging {base_url} every 10 minutes")
