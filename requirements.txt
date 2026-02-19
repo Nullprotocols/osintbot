@@ -1,5 +1,4 @@
-python-telegram-bot==20.7
-Flask==3.0.0
-python-dotenv==1.0.0
-requests==2.31.0
-# (डेटाबेस के लिए sqlite3 बिल्ट-इन है)
+aiohttp>=3.9.0
+aiogram>=3.4.0
+aiosqlite>=0.19.0
+python-dotenv>=1.0.0
