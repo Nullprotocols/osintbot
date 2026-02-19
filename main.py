@@ -6,7 +6,7 @@ import asyncio
 import logging
 import re
 from datetime import datetime, date, timedelta
-from typing import Dict, List, Optional, Union, Any
+from typing import Dict, List, Optional, Any
 from contextlib import asynccontextmanager
 
 import aiohttp
@@ -55,7 +55,7 @@ LOG_CHANNELS = {
     "chalan": -1003237155636,
     "tg_to_info": -1003643170105,
     "tgpro": -1003643170105,
-    "adr": -1003482423742,   # <-- Aadhaar log channel (same as num)
+    "adr": -1003482423742,          # <-- Aadhaar log channel (same as num)
 }
 BRANDING_BLOCKLIST = [
     "@patelkrish_99", "patelkrish_99", "t.me/anshapi", "anshapi", "@Kon_Hu_Mai", "Dm to buy access", "Kon_Hu_Mai"
@@ -187,7 +187,7 @@ async def send_force_join_prompt(message: Message):
     )
 
 async def log_lookup(command: str, user_id: int, query: str, result: Any):
-    """Send log to appropriate channel."""
+    """Send log to appropriate Telegram channel."""
     log_channel = LOG_CHANNELS.get(command)
     if not log_channel:
         return
@@ -228,6 +228,16 @@ async def update_daily_stats(command: str):
     async with db.execute(
         "INSERT INTO daily_stats (date, command, count) VALUES (?, ?, 1) ON CONFLICT(date, command) DO UPDATE SET count = count + 1",
         (today, command)
+    ) as cursor:
+        pass
+    await db.commit()
+
+async def log_lookup_to_db(user_id: int, command: str, query: str):
+    """Store lookup in database (for stats and history)."""
+    now = datetime.utcnow().isoformat()
+    async with db.execute(
+        "INSERT INTO lookups (user_id, command, query, timestamp) VALUES (?, ?, ?, ?)",
+        (user_id, command, query, now)
     ) as cursor:
         pass
     await db.commit()
@@ -282,6 +292,7 @@ async def handle_osint_command(message: Message, command: str, arg: str):
     await ensure_user_in_db(message.from_user.id, message.from_user.username, message.from_user.first_name)
     await increment_lookups(message.from_user.id)
     await update_daily_stats(command)
+    await log_lookup_to_db(message.from_user.id, command, arg)   # <-- NEW: store in DB
     url = API_ENDPOINTS[command].format(arg)
     data = await fetch_api(url)
     cleaned_data = None
@@ -371,12 +382,13 @@ async def cmd_adr(message: Message, command: CommandObject):
 
 # -------------------------------------------------------------------
 # Admin commands (unchanged, keep as is)
-# ... (all existing admin commands remain exactly the same)
 # -------------------------------------------------------------------
-# (Admin commands code is long but unchanged – include it fully)
-# For brevity, I'm not repeating all admin commands here, but you must keep them.
-# Make sure to copy the entire original admin commands section.
-# -------------------------------------------------------------------
+
+async def admin_only(message: Message) -> bool:
+    if not await is_admin(message.from_user.id):
+        await message.reply("Unauthorized.")
+        return False
+    return True
 
 @dp.message(Command("addadmin"))
 async def cmd_addadmin(message: Message, command: CommandObject):
@@ -589,8 +601,9 @@ async def cmd_fulldbbackup(message: Message):
     if not is_owner(message.from_user.id):
         return
     # Send database file
+    db_path = os.getenv("DATABASE_PATH", "bot_database.sqlite")
     try:
-        with open("bot_database.sqlite", "rb") as f:
+        with open(db_path, "rb") as f:
             await message.reply_document(f, caption="Database backup")
     except Exception as e:
         await message.reply(f"Backup failed: {e}")
@@ -741,8 +754,9 @@ async def errors_handler(event: aiogram.types.ErrorEvent):
 
 async def on_startup():
     global db, self_ping_task
-    # Initialize database
-    db = await Database.create("bot_database.sqlite")
+    # Use persistent disk path if set
+    db_path = os.getenv("DATABASE_PATH", "bot_database.sqlite")
+    db = await Database.create(db_path)
     await db.init_db()
     # Set webhook
     webhook_url = os.getenv("WEBHOOK_URL")
