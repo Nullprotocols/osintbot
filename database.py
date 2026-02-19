@@ -1,4 +1,3 @@
-# database.py
 import aiosqlite
 import csv
 import io
@@ -25,7 +24,7 @@ class Database:
 
     async def init_db(self):
         """Create all necessary tables if they don't exist."""
-        # Users table (as used in main.py)
+        # Users table
         await self.connection.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -36,7 +35,7 @@ class Database:
                 total_lookups INTEGER DEFAULT 0
             )
         ''')
-        # Admins table (separate from users)
+        # Admins table
         await self.connection.execute('''
             CREATE TABLE IF NOT EXISTS admins (
                 user_id INTEGER PRIMARY KEY
@@ -67,7 +66,7 @@ class Database:
                 PRIMARY KEY (date, command)
             )
         ''')
-        # Broadcasts (optional, from original)
+        # Broadcasts (optional)
         await self.connection.execute('''
             CREATE TABLE IF NOT EXISTS broadcasts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -80,7 +79,7 @@ class Database:
         await self.connection.commit()
 
     async def execute(self, sql, params=None):
-        """Execute a raw SQL query and return a cursor (supports async with)."""
+        """Execute a raw SQL query and return a cursor."""
         if params is None:
             params = ()
         return await self.connection.execute(sql, params)
@@ -95,11 +94,11 @@ class Database:
             await self.connection.close()
 
     # ------------------------------------------------------------------
-    # Convenience methods (for future use / compatibility)
+    # Convenience methods
     # ------------------------------------------------------------------
 
     async def add_user(self, user_id, username=None, first_name=None, first_seen=None, last_seen=None):
-        """Insert or ignore a user (used by ensure_user_in_db in main.py)."""
+        """Insert or ignore a user."""
         await self.execute(
             "INSERT OR IGNORE INTO users (user_id, username, first_name, first_seen, last_seen, total_lookups) VALUES (?, ?, ?, ?, ?, 0)",
             (user_id, username, first_name, first_seen, last_seen)
@@ -229,7 +228,7 @@ class Database:
         total_lookups = (await cursor.fetchone())[0]
         return total_users, total_lookups
 
-    # Broadcasts (from original)
+    # Broadcasts
     async def log_broadcast(self, admin_id, message, msg_type):
         now = datetime.utcnow().isoformat()
         await self.execute(
