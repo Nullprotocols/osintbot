@@ -1,235 +1,250 @@
-import sqlite3
+# database.py
+import aiosqlite
 import csv
 import io
+import os
 from datetime import datetime, timedelta
 
-DB_FILE = "bot_data.db"
+class Database:
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self.connection = None
 
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    # Users table
-    c.execute('''CREATE TABLE IF NOT EXISTS users
-                 (user_id INTEGER PRIMARY KEY,
-                  username TEXT,
-                  first_name TEXT,
-                  last_name TEXT,
-                  joined_date TEXT,
-                  is_banned INTEGER DEFAULT 0,
-                  is_admin INTEGER DEFAULT 0,
-                  is_owner INTEGER DEFAULT 0,
-                  referred_by INTEGER DEFAULT NULL)''')
-    # Logs table
-    c.execute('''CREATE TABLE IF NOT EXISTS logs
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  user_id INTEGER,
-                  command TEXT,
-                  timestamp TEXT,
-                  result TEXT)''')
-    # Broadcast history (optional)
-    c.execute('''CREATE TABLE IF NOT EXISTS broadcasts
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  admin_id INTEGER,
-                  message TEXT,
-                  type TEXT,
-                  timestamp TEXT)''')
-    conn.commit()
-    conn.close()
+    @classmethod
+    async def create(cls, db_path="bot_database.sqlite"):
+        """Factory method to create and initialize database instance."""
+        # Allow override via environment (useful for Render persistent disk)
+        persistent_path = os.getenv("DATABASE_PATH")
+        if persistent_path:
+            db_path = persistent_path
+        self = cls(db_path)
+        self.connection = await aiosqlite.connect(db_path)
+        # Enable foreign keys if needed (optional)
+        await self.connection.execute("PRAGMA foreign_keys = ON")
+        return self
 
-# ---------- User Management ----------
-def add_user(user_id, username, first_name, last_name, referred_by=None):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    now = datetime.now().isoformat()
-    c.execute('''INSERT OR IGNORE INTO users 
-                 (user_id, username, first_name, last_name, joined_date, referred_by)
-                 VALUES (?, ?, ?, ?, ?, ?)''',
-              (user_id, username, first_name, last_name, now, referred_by))
-    conn.commit()
-    conn.close()
+    async def init_db(self):
+        """Create all necessary tables if they don't exist."""
+        # Users table (as used in main.py)
+        await self.connection.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                first_seen TEXT,
+                last_seen TEXT,
+                total_lookups INTEGER DEFAULT 0
+            )
+        ''')
+        # Admins table (separate from users)
+        await self.connection.execute('''
+            CREATE TABLE IF NOT EXISTS admins (
+                user_id INTEGER PRIMARY KEY
+            )
+        ''')
+        # Banned users table
+        await self.connection.execute('''
+            CREATE TABLE IF NOT EXISTS banned (
+                user_id INTEGER PRIMARY KEY
+            )
+        ''')
+        # Individual lookups log
+        await self.connection.execute('''
+            CREATE TABLE IF NOT EXISTS lookups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                command TEXT,
+                query TEXT,
+                timestamp TEXT
+            )
+        ''')
+        # Daily statistics
+        await self.connection.execute('''
+            CREATE TABLE IF NOT EXISTS daily_stats (
+                date TEXT,
+                command TEXT,
+                count INTEGER DEFAULT 0,
+                PRIMARY KEY (date, command)
+            )
+        ''')
+        # Broadcasts (optional, from original)
+        await self.connection.execute('''
+            CREATE TABLE IF NOT EXISTS broadcasts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_id INTEGER,
+                message TEXT,
+                type TEXT,
+                timestamp TEXT
+            )
+        ''')
+        await self.connection.commit()
 
-def get_user(user_id):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
-    user = c.fetchone()
-    conn.close()
-    return user
+    async def execute(self, sql, params=None):
+        """Execute a raw SQL query and return a cursor (supports async with)."""
+        if params is None:
+            params = ()
+        return await self.connection.execute(sql, params)
 
-def update_user_activity(user_id):
-    # हर बार जब यूजर कमांड करे तो joined_date को अपडेट कर सकते हैं (नया फील्ड last_active)
-    # फिलहाल सिर्फ get_user से काम चलेगा
-    pass
+    async def commit(self):
+        """Commit the current transaction."""
+        await self.connection.commit()
 
-def ban_user(user_id):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("UPDATE users SET is_banned=1 WHERE user_id=?", (user_id,))
-    conn.commit()
-    conn.close()
+    async def close(self):
+        """Close the database connection."""
+        if self.connection:
+            await self.connection.close()
 
-def unban_user(user_id):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("UPDATE users SET is_banned=0 WHERE user_id=?", (user_id,))
-    conn.commit()
-    conn.close()
+    # ------------------------------------------------------------------
+    # Convenience methods (for future use / compatibility)
+    # ------------------------------------------------------------------
 
-def delete_user(user_id):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("DELETE FROM users WHERE user_id=?", (user_id,))
-    conn.commit()
-    conn.close()
+    async def add_user(self, user_id, username=None, first_name=None, first_seen=None, last_seen=None):
+        """Insert or ignore a user (used by ensure_user_in_db in main.py)."""
+        await self.execute(
+            "INSERT OR IGNORE INTO users (user_id, username, first_name, first_seen, last_seen, total_lookups) VALUES (?, ?, ?, ?, ?, 0)",
+            (user_id, username, first_name, first_seen, last_seen)
+        )
+        await self.commit()
 
-def search_users(query):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('''SELECT * FROM users WHERE 
-                 username LIKE ? OR first_name LIKE ? OR last_name LIKE ? OR user_id LIKE ?''',
-              (f'%{query}%', f'%{query}%', f'%{query}%', f'%{query}%'))
-    users = c.fetchall()
-    conn.close()
-    return users
+    async def update_user_last_seen(self, user_id, last_seen, username=None, first_name=None):
+        """Update last_seen and optionally username/first_name."""
+        await self.execute(
+            "UPDATE users SET last_seen = ?, username = COALESCE(?, username), first_name = COALESCE(?, first_name) WHERE user_id = ?",
+            (last_seen, username, first_name, user_id)
+        )
+        await self.commit()
 
-def get_all_users(limit=10, offset=0):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT * FROM users ORDER BY joined_date DESC LIMIT ? OFFSET ?", (limit, offset))
-    users = c.fetchall()
-    conn.close()
-    return users
+    async def increment_lookups(self, user_id):
+        """Increment total_lookups for a user."""
+        await self.execute(
+            "UPDATE users SET total_lookups = total_lookups + 1 WHERE user_id = ?",
+            (user_id,)
+        )
+        await self.commit()
 
-def count_users():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM users")
-    count = c.fetchone()[0]
-    conn.close()
-    return count
+    async def log_lookup(self, user_id, command, query):
+        """Insert a lookup record into lookups table."""
+        now = datetime.utcnow().isoformat()
+        await self.execute(
+            "INSERT INTO lookups (user_id, command, query, timestamp) VALUES (?, ?, ?, ?)",
+            (user_id, command, query, now)
+        )
+        await self.commit()
 
-def get_recent_users(days):
-    since = (datetime.now() - timedelta(days=days)).isoformat()
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT * FROM users WHERE joined_date >= ?", (since,))
-    users = c.fetchall()
-    conn.close()
-    return users
+    async def update_daily_stats(self, command):
+        """Increment daily stats for a command."""
+        today = datetime.utcnow().date().isoformat()
+        await self.execute(
+            "INSERT INTO daily_stats (date, command, count) VALUES (?, ?, 1) ON CONFLICT(date, command) DO UPDATE SET count = count + 1",
+            (today, command)
+        )
+        await self.commit()
 
-def get_inactive_users(days):
-    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
-    # यहाँ last_active फील्ड होना चाहिए; अगर नहीं है तो joined_date से अनुमान लगा सकते हैं
-    # फिलहाल हम सभी users लौटाते हैं (अपडेट की जरूरत)
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT * FROM users WHERE joined_date < ?", (cutoff,))
-    users = c.fetchall()
-    conn.close()
-    return users
+    # User management
+    async def get_user(self, user_id):
+        cursor = await self.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+        return await cursor.fetchone()
 
-def add_admin(user_id):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("UPDATE users SET is_admin=1 WHERE user_id=?", (user_id,))
-    conn.commit()
-    conn.close()
+    async def get_all_users(self, limit=10, offset=0):
+        cursor = await self.execute("SELECT * FROM users ORDER BY last_seen DESC LIMIT ? OFFSET ?", (limit, offset))
+        return await cursor.fetchall()
 
-def remove_admin(user_id):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("UPDATE users SET is_admin=0 WHERE user_id=?", (user_id,))
-    conn.commit()
-    conn.close()
+    async def count_users(self):
+        cursor = await self.execute("SELECT COUNT(*) FROM users")
+        row = await cursor.fetchone()
+        return row[0] if row else 0
 
-def list_admins():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT user_id, username FROM users WHERE is_admin=1 OR is_owner=1")
-    admins = c.fetchall()
-    conn.close()
-    return admins
+    async def search_users(self, query):
+        cursor = await self.execute(
+            "SELECT * FROM users WHERE user_id LIKE ? OR username LIKE ? OR first_name LIKE ?",
+            (f'%{query}%', f'%{query}%', f'%{query}%')
+        )
+        return await cursor.fetchall()
 
-def is_owner(user_id):
-    user = get_user(user_id)
-    return user and user[6] == 1  # is_owner column index 6 (0-indexed) - adjust if needed
+    async def get_recent_users(self, days):
+        since = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        cursor = await self.execute("SELECT * FROM users WHERE last_seen >= ?", (since,))
+        return await cursor.fetchall()
 
-def is_admin(user_id):
-    user = get_user(user_id)
-    return user and (user[5] == 1 or user[6] == 1)  # is_admin or is_owner
+    async def get_inactive_users(self, days):
+        cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        cursor = await self.execute("SELECT * FROM users WHERE last_seen < ?", (cutoff,))
+        return await cursor.fetchall()
 
-# ---------- Logs ----------
-def log_command(user_id, command, result=""):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    now = datetime.now().isoformat()
-    c.execute("INSERT INTO logs (user_id, command, timestamp, result) VALUES (?, ?, ?, ?)",
-              (user_id, command, now, result[:500]))  # result truncated
-    conn.commit()
-    conn.close()
+    async def delete_user(self, user_id):
+        await self.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+        await self.commit()
 
-def get_user_logs(user_id, limit=10):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT * FROM logs WHERE user_id=? ORDER BY timestamp DESC LIMIT ?", (user_id, limit))
-    logs = c.fetchall()
-    conn.close()
-    return logs
+    # Admin management
+    async def add_admin(self, user_id):
+        await self.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (user_id,))
+        await self.commit()
 
-def get_stats():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    total_users = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    total_banned = c.execute("SELECT COUNT(*) FROM users WHERE is_banned=1").fetchone()[0]
-    total_admins = c.execute("SELECT COUNT(*) FROM users WHERE is_admin=1").fetchone()[0]
-    total_logs = c.execute("SELECT COUNT(*) FROM logs").fetchone()[0]
-    conn.close()
-    return total_users, total_banned, total_admins, total_logs
+    async def remove_admin(self, user_id):
+        await self.execute("DELETE FROM admins WHERE user_id = ?", (user_id,))
+        await self.commit()
 
-def get_daily_stats(days):
-    since = (datetime.now() - timedelta(days=days)).isoformat()
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('''SELECT DATE(timestamp), COUNT(*) FROM logs 
-                 WHERE timestamp >= ? GROUP BY DATE(timestamp)''', (since,))
-    stats = c.fetchall()
-    conn.close()
-    return stats
+    async def list_admins(self):
+        cursor = await self.execute("SELECT user_id FROM admins")
+        return await cursor.fetchall()
 
-def get_lookup_stats():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('''SELECT command, COUNT(*) FROM logs GROUP BY command ORDER BY COUNT(*) DESC''')
-    stats = c.fetchall()
-    conn.close()
-    return stats
+    async def is_admin(self, user_id):
+        cursor = await self.execute("SELECT user_id FROM admins WHERE user_id = ?", (user_id,))
+        return await cursor.fetchone() is not None
 
-def get_top_referrers(limit=10):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('''SELECT referred_by, COUNT(*) FROM users 
-                 WHERE referred_by IS NOT NULL GROUP BY referred_by ORDER BY COUNT(*) DESC LIMIT ?''', (limit,))
-    top = c.fetchall()
-    conn.close()
-    return top
+    # Ban management
+    async def ban_user(self, user_id):
+        await self.execute("INSERT OR IGNORE INTO banned (user_id) VALUES (?)", (user_id,))
+        await self.commit()
 
-# ---------- Backup ----------
-def backup_users():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT * FROM users")
-    users = c.fetchall()
-    conn.close()
-    return users
+    async def unban_user(self, user_id):
+        await self.execute("DELETE FROM banned WHERE user_id = ?", (user_id,))
+        await self.commit()
 
-def backup_to_csv():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT * FROM users")
-    rows = c.fetchall()
-    conn.close()
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(['user_id','username','first_name','last_name','joined_date','is_banned','is_admin','is_owner','referred_by'])
-    writer.writerows(rows)
-    return output.getvalue()
+    async def is_banned(self, user_id):
+        cursor = await self.execute("SELECT user_id FROM banned WHERE user_id = ?", (user_id,))
+        return await cursor.fetchone() is not None
+
+    # Lookups / logs
+    async def get_user_lookups(self, user_id, limit=20):
+        cursor = await self.execute(
+            "SELECT command, query, timestamp FROM lookups WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?",
+            (user_id, limit)
+        )
+        return await cursor.fetchall()
+
+    async def get_lookup_stats(self):
+        cursor = await self.execute("SELECT command, COUNT(*) FROM lookups GROUP BY command ORDER BY COUNT(*) DESC")
+        return await cursor.fetchall()
+
+    async def get_daily_stats(self, date=None):
+        if date is None:
+            date = datetime.utcnow().date().isoformat()
+        cursor = await self.execute("SELECT command, count FROM daily_stats WHERE date = ?", (date,))
+        return await cursor.fetchall()
+
+    async def get_overall_stats(self):
+        total_users = await self.count_users()
+        cursor = await self.execute("SELECT COUNT(*) FROM lookups")
+        total_lookups = (await cursor.fetchone())[0]
+        return total_users, total_lookups
+
+    # Broadcasts (from original)
+    async def log_broadcast(self, admin_id, message, msg_type):
+        now = datetime.utcnow().isoformat()
+        await self.execute(
+            "INSERT INTO broadcasts (admin_id, message, type, timestamp) VALUES (?, ?, ?, ?)",
+            (admin_id, message, msg_type, now)
+        )
+        await self.commit()
+
+    # Backup
+    async def backup_users_csv(self):
+        """Return CSV string of all users."""
+        users = await self.get_all_users(limit=1000000)  # get all
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(['user_id', 'username', 'first_name', 'first_seen', 'last_seen', 'total_lookups'])
+        for u in users:
+            writer.writerow(u)
+        return output.getvalue()
