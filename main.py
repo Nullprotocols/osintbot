@@ -2,16 +2,14 @@ import os
 import json
 import re
 import logging
-import sqlite3
 import csv
 import io
 import asyncio
 from datetime import datetime, timedelta
-from typing import Union, Optional
-from contextlib import closing
+from typing import Union, Optional, List, Dict, Any
 
 import aiohttp
-import uvicorn
+import asyncpg
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -21,22 +19,32 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 
-# ---------- Environment ----------
+# ---------- Environment & Configuration ----------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN missing")
+    raise ValueError("BOT_TOKEN environment variable is missing")
 
 OWNER_ID = int(os.environ.get("BOT_OWNER_ID", "8104850843"))
-ADMIN_IDS = [int(x.strip()) for x in os.environ.get("BOT_ADMIN_IDS", "8104850843,5987905091").split(",")]
-FORCE_CHANNEL1_ID = int(os.environ.get("FORCE_CHNNEL1ID", "-1003090922367"))
-FORCE_CHANNEL2_ID = int(os.environ.get("FORCE_CHNNEL2ID", "-1003698567122"))
+ADMIN_IDS = [
+    int(x.strip()) for x in os.environ.get("BOT_ADMIN_IDS", "8104850843,5987905091").split(",")
+]
+FORCE_CHANNEL1_ID = int(os.environ.get("FORCE_CHANNEL1_ID", "-1003090922367"))
+FORCE_CHANNEL2_ID = int(os.environ.get("FORCE_CHANNEL2_ID", "-1003698567122"))
 FORCE_CHANNEL1_LINK = os.environ.get("FORCE_CHANNEL1_LINK", "https://t.me/all_data_here")
 FORCE_CHANNEL2_LINK = os.environ.get("FORCE_CHANNEL2_LINK", "https://t.me/osint_lookup")
 
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # e.g. https://your-app.onrender.com/webhook
+# PostgreSQL connection string (provided by Render)
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL environment variable is missing")
+
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL") or os.environ.get("RENDER_EXTERNAL_URL")
+if not WEBHOOK_URL:
+    raise ValueError("WEBHOOK_URL or RENDER_EXTERNAL_URL must be set")
+
 PORT = int(os.environ.get("PORT", 8080))
 
-# Branding to remove (global)
+# Branding removal (global)
 BRANDING_BLACKLIST = [
     '@patelkrish_99', 'patelkrish_99', 't.me/anshapi', 'anshapi',
     '"@Kon_Hu_Mai"', 'Dm to buy access', '"Dm to buy access"', 'Kon_Hu_Mai'
@@ -54,119 +62,209 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ---------- Database ----------
-DB_PATH = "bot_data.db"
+# ---------- PostgreSQL Database (async) ----------
+class Database:
+    _pool: asyncpg.Pool = None
 
-def init_db():
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        c = conn.cursor()
-        # Users table
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
-                last_name TEXT,
-                joined_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_activity TIMESTAMP,
-                is_banned INTEGER DEFAULT 0,
-                is_admin INTEGER DEFAULT 0
+    @classmethod
+    async def init_pool(cls):
+        """Create a connection pool to PostgreSQL."""
+        cls._pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+        await cls.create_tables()
+
+    @classmethod
+    async def close_pool(cls):
+        """Close the connection pool."""
+        if cls._pool:
+            await cls._pool.close()
+
+    @classmethod
+    async def create_tables(cls):
+        """Create necessary tables if they do not exist."""
+        async with cls._pool.acquire() as conn:
+            # Users table
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id BIGINT PRIMARY KEY,
+                    username TEXT,
+                    first_name TEXT,
+                    last_name TEXT,
+                    joined_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_activity TIMESTAMP,
+                    is_banned INTEGER DEFAULT 0,
+                    is_admin INTEGER DEFAULT 0
+                )
+            ''')
+            # Lookups table
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS lookups (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
+                    command TEXT,
+                    input TEXT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    result_summary TEXT
+                )
+            ''')
+            # Ensure initial admins from env are stored
+            for admin_id in ADMIN_IDS:
+                await conn.execute('''
+                    INSERT INTO users (user_id, is_admin)
+                    VALUES ($1, 1)
+                    ON CONFLICT (user_id) DO UPDATE SET is_admin = 1
+                ''', admin_id)
+            logger.info("Database tables initialized")
+
+    @classmethod
+    async def get_user(cls, user_id: int) -> Optional[Dict[str, Any]]:
+        async with cls._pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
+            return dict(row) if row else None
+
+    @classmethod
+    async def add_or_update_user(cls, user_id: int, username: str = None,
+                                 first_name: str = None, last_name: str = None):
+        async with cls._pool.acquire() as conn:
+            await conn.execute('''
+                INSERT INTO users (user_id, username, first_name, last_name, last_activity)
+                VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+                ON CONFLICT (user_id) DO UPDATE SET
+                    username = EXCLUDED.username,
+                    first_name = EXCLUDED.first_name,
+                    last_name = EXCLUDED.last_name,
+                    last_activity = CURRENT_TIMESTAMP
+            ''', user_id, username, first_name, last_name)
+
+    @classmethod
+    async def update_activity(cls, user_id: int):
+        async with cls._pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET last_activity = CURRENT_TIMESTAMP WHERE user_id = $1",
+                user_id
             )
-        ''')
-        # Lookups table
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS lookups (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                command TEXT,
-                input TEXT,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                result_summary TEXT,
-                FOREIGN KEY(user_id) REFERENCES users(user_id)
+
+    @classmethod
+    async def add_lookup(cls, user_id: int, command: str, input_str: str, result_summary: str = ""):
+        async with cls._pool.acquire() as conn:
+            await conn.execute('''
+                INSERT INTO lookups (user_id, command, input, result_summary)
+                VALUES ($1, $2, $3, $4)
+            ''', user_id, command, input_str, result_summary[:500])
+
+    @classmethod
+    async def is_user_banned(cls, user_id: int) -> bool:
+        async with cls._pool.acquire() as conn:
+            val = await conn.fetchval("SELECT is_banned FROM users WHERE user_id = $1", user_id)
+            return bool(val) if val is not None else False
+
+    @classmethod
+    async def set_ban(cls, user_id: int, ban: bool):
+        async with cls._pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET is_banned = $1 WHERE user_id = $2",
+                1 if ban else 0, user_id
             )
-        ''')
-        # Ensure initial admins from env are stored
-        for admin_id in ADMIN_IDS:
-            c.execute("INSERT OR IGNORE INTO users (user_id, is_admin) VALUES (?, 1)", (admin_id,))
-        # Owner is not stored as admin flag but handled via OWNER_ID check
-        conn.commit()
 
-def get_user(user_id: int) -> Optional[dict]:
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-        row = c.fetchone()
-        return dict(row) if row else None
+    @classmethod
+    async def set_admin(cls, user_id: int, admin: bool):
+        async with cls._pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET is_admin = $1 WHERE user_id = $2",
+                1 if admin else 0, user_id
+            )
 
-def add_or_update_user(user_id: int, username: str = None, first_name: str = None, last_name: str = None):
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        c = conn.cursor()
-        c.execute('''
-            INSERT INTO users (user_id, username, first_name, last_name, last_activity)
-            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(user_id) DO UPDATE SET
-                username = excluded.username,
-                first_name = excluded.first_name,
-                last_name = excluded.last_name,
-                last_activity = CURRENT_TIMESTAMP
-        ''', (user_id, username, first_name, last_name))
-        conn.commit()
+    @classmethod
+    async def get_all_users(cls, include_banned: bool = False) -> List[Dict[str, Any]]:
+        async with cls._pool.acquire() as conn:
+            if include_banned:
+                rows = await conn.fetch("SELECT * FROM users")
+            else:
+                rows = await conn.fetch("SELECT * FROM users WHERE is_banned = 0")
+            return [dict(r) for r in rows]
 
-def update_activity(user_id: int):
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        c = conn.cursor()
-        c.execute("UPDATE users SET last_activity = CURRENT_TIMESTAMP WHERE user_id = ?", (user_id,))
-        conn.commit()
+    @classmethod
+    async def get_user_lookups(cls, user_id: int, limit: int = 50) -> List[Dict[str, Any]]:
+        async with cls._pool.acquire() as conn:
+            rows = await conn.fetch('''
+                SELECT command, input, timestamp FROM lookups
+                WHERE user_id = $1
+                ORDER BY timestamp DESC LIMIT $2
+            ''', user_id, limit)
+            return [dict(r) for r in rows]
 
-def add_lookup(user_id: int, command: str, input_str: str, result_summary: str = ""):
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        c = conn.cursor()
-        c.execute('''
-            INSERT INTO lookups (user_id, command, input, result_summary)
-            VALUES (?, ?, ?, ?)
-        ''', (user_id, command, input_str, result_summary[:500]))
-        conn.commit()
+    # Additional admin stats methods (all async)
+    @classmethod
+    async def get_stats(cls):
+        async with cls._pool.acquire() as conn:
+            total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
+            banned = await conn.fetchval("SELECT COUNT(*) FROM users WHERE is_banned = 1")
+            total_lookups = await conn.fetchval("SELECT COUNT(*) FROM lookups")
+            active_users = await conn.fetchval("SELECT COUNT(DISTINCT user_id) FROM lookups")
+            return total_users, banned, total_lookups, active_users
 
-def is_user_banned(user_id: int) -> bool:
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        c = conn.cursor()
-        c.execute("SELECT is_banned FROM users WHERE user_id = ?", (user_id,))
-        row = c.fetchone()
-        return row and row[0] == 1
+    @classmethod
+    async def get_lookup_stats_per_command(cls):
+        async with cls._pool.acquire() as conn:
+            rows = await conn.fetch('''
+                SELECT command, COUNT(*) as cnt FROM lookups
+                GROUP BY command ORDER BY cnt DESC
+            ''')
+            return [(r['command'], r['cnt']) for r in rows]
 
-def set_ban(user_id: int, ban: bool):
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        c = conn.cursor()
-        c.execute("UPDATE users SET is_banned = ? WHERE user_id = ?", (1 if ban else 0, user_id))
-        conn.commit()
+    @classmethod
+    async def get_daily_lookups(cls, days: int):
+        data = []
+        for i in range(days):
+            day = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
+            async with cls._pool.acquire() as conn:
+                cnt = await conn.fetchval('''
+                    SELECT COUNT(*) FROM lookups WHERE DATE(timestamp) = $1
+                ''', day)
+                data.append((day, cnt))
+        return data
 
-def set_admin(user_id: int, admin: bool):
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        c = conn.cursor()
-        c.execute("UPDATE users SET is_admin = ? WHERE user_id = ?", (1 if admin else 0, user_id))
-        conn.commit()
+    @classmethod
+    async def get_leaderboard(cls, limit: int = 10):
+        async with cls._pool.acquire() as conn:
+            rows = await conn.fetch('''
+                SELECT user_id, COUNT(*) as cnt FROM lookups
+                GROUP BY user_id ORDER BY cnt DESC LIMIT $1
+            ''', limit)
+            return [dict(r) for r in rows]
 
-def get_all_users(include_banned=False):
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        if include_banned:
-            c.execute("SELECT * FROM users")
-        else:
-            c.execute("SELECT * FROM users WHERE is_banned = 0")
-        return [dict(row) for row in c.fetchall()]
+    @classmethod
+    async def get_inactive_count(cls, days: int):
+        since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        async with cls._pool.acquire() as conn:
+            cnt = await conn.fetchval('''
+                SELECT COUNT(*) FROM users
+                WHERE last_activity < $1 OR last_activity IS NULL
+            ''', since)
+            return cnt
 
-def get_user_lookups(user_id: int, limit: int = 50):
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        c.execute('''
-            SELECT command, input, timestamp FROM lookups
-            WHERE user_id = ?
-            ORDER BY timestamp DESC LIMIT ?
-        ''', (user_id, limit))
-        return [dict(row) for row in c.fetchall()]
+    @classmethod
+    async def get_recent_users(cls, days: int):
+        since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        async with cls._pool.acquire() as conn:
+            rows = await conn.fetch('''
+                SELECT * FROM users WHERE last_activity >= $1 ORDER BY last_activity DESC
+            ''', since)
+            return [dict(r) for r in rows]
+
+    @classmethod
+    async def delete_user(cls, user_id: int):
+        async with cls._pool.acquire() as conn:
+            await conn.execute("DELETE FROM users WHERE user_id = $1", user_id)
+
+    @classmethod
+    async def search_users(cls, query: str):
+        async with cls._pool.acquire() as conn:
+            rows = await conn.fetch('''
+                SELECT * FROM users WHERE
+                username ILIKE $1 OR first_name ILIKE $1 OR last_name ILIKE $1 OR user_id::text ILIKE $1
+                LIMIT 20
+            ''', f'%{query}%')
+            return [dict(r) for r in rows]
 
 # ---------- FastAPI & Telegram App ----------
 app = FastAPI()
@@ -177,7 +275,7 @@ async def is_admin_or_owner(user_id: int) -> bool:
     """Check if user is in DB as admin or is owner."""
     if user_id == OWNER_ID:
         return True
-    user = get_user(user_id)
+    user = await Database.get_user(user_id)
     return user and user.get("is_admin") == 1
 
 async def check_force_channels(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> (bool, str):
@@ -245,7 +343,9 @@ def format_json_output(raw_json: dict, command: str = "") -> str:
 # ---------- Command Handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    add_or_update_user(user.id, user.username, user.first_name, user.last_name)
+    await Database.add_or_update_user(
+        user.id, user.username, user.first_name, user.last_name
+    )
     if update.effective_chat.type == "private":
         # Private chat: suggest group bot
         await update.message.reply_text(
@@ -305,7 +405,7 @@ def make_api_handler(api_url_template, input_processor=None, extra_branding_blac
     """Create a command handler for a given API."""
     async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
-        add_or_update_user(user.id, user.username, user.first_name, user.last_name)
+        await Database.add_or_update_user(user.id, user.username, user.first_name, user.last_name)
         chat = update.effective_chat
 
         # Private chat restriction
@@ -335,10 +435,6 @@ def make_api_handler(api_url_template, input_processor=None, extra_branding_blac
 
         # Construct URL
         url = api_url_template.format(input=inp)
-        # Some APIs use query params; we'll just format the template directly
-        # If template has {input} we replace; otherwise we append as ?key=value? We'll handle both.
-        # In most cases we can just pass input as part of URL string.
-        # For those with explicit ?param= we'll use string formatting.
 
         # Fetch
         raw_data = await fetch_api(url)
@@ -357,7 +453,7 @@ def make_api_handler(api_url_template, input_processor=None, extra_branding_blac
         await update.message.reply_text(output, parse_mode=ParseMode.MARKDOWN)
 
         # Record lookup
-        add_lookup(user.id, context.command[0], inp, json.dumps(cleaned)[:200])
+        await Database.add_lookup(user.id, context.command[0], inp, json.dumps(cleaned)[:200])
 
     return handler
 
@@ -395,12 +491,11 @@ async def is_admin_filter(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin_filter(update, context):
         return
-    # Broadcast logic: if replying to a message, send that message to all users
     if not update.message.reply_to_message:
         await update.message.reply_text("Reply to a message with /broadcast to send it to all users.")
         return
 
-    users = get_all_users(include_banned=False)
+    users = await Database.get_all_users(include_banned=False)
     sent = 0
     failed = 0
     for u in users:
@@ -418,7 +513,6 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def dm_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin_filter(update, context):
         return
-    # /dm <user_id> <text>  OR reply to a message with /dm <user_id>
     if not context.args and not update.message.reply_to_message:
         await update.message.reply_text("Usage: /dm <user_id> <text> or reply to a message with /dm <user_id>")
         return
@@ -429,7 +523,6 @@ async def dm_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_id = int(context.args[0])
         text = " ".join(context.args[1:]) if len(context.args) > 1 else None
     if update.message.reply_to_message:
-        # Use reply message as content
         target_id = int(context.args[0]) if context.args else None
         if not target_id:
             await update.message.reply_text("Please provide user ID when replying.")
@@ -454,7 +547,6 @@ async def dm_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def bulk_dm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin_filter(update, context):
         return
-    # /bulkdm id1,id2,id3,... <text> or reply
     if not context.args and not update.message.reply_to_message:
         await update.message.reply_text("Usage: /bulkdm id1,id2,... <text> or reply with /bulkdm id1,id2,...")
         return
@@ -470,7 +562,6 @@ async def bulk_dm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Invalid ID list. Use comma separated numbers.")
         return
     if update.message.reply_to_message:
-        # send the reply message to all
         sent = 0
         failed = 0
         for uid in ids:
@@ -505,7 +596,7 @@ async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         uid = int(context.args[0])
-        set_ban(uid, True)
+        await Database.set_ban(uid, True)
         await update.message.reply_text(f"User {uid} banned.")
     except:
         await update.message.reply_text("Invalid ID.")
@@ -518,7 +609,7 @@ async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         uid = int(context.args[0])
-        set_ban(uid, False)
+        await Database.set_ban(uid, False)
         await update.message.reply_text(f"User {uid} unbanned.")
     except:
         await update.message.reply_text("Invalid ID.")
@@ -531,10 +622,7 @@ async def delete_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         uid = int(context.args[0])
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            c.execute("DELETE FROM users WHERE user_id = ?", (uid,))
-            conn.commit()
+        await Database.delete_user(uid)
         await update.message.reply_text(f"User {uid} deleted.")
     except:
         await update.message.reply_text("Invalid ID or error.")
@@ -546,21 +634,12 @@ async def search_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /searchuser <query> (username or name)")
         return
     query = " ".join(context.args)
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        c.execute('''
-            SELECT * FROM users WHERE
-            username LIKE ? OR first_name LIKE ? OR last_name LIKE ? OR user_id LIKE ?
-            LIMIT 20
-        ''', (f"%{query}%", f"%{query}%", f"%{query}%", f"%{query}%"))
-        rows = c.fetchall()
+    rows = await Database.search_users(query)
     if not rows:
         await update.message.reply_text("No users found.")
         return
     msg = "**Search Results:**\n"
-    for r in rows:
-        u = dict(r)
+    for u in rows:
         msg += f"🆔 `{u['user_id']}` | @{u.get('username','')} | {u.get('first_name','')} | Banned: {u['is_banned']}\n"
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
@@ -572,13 +651,9 @@ async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         page = int(context.args[0])
     per_page = 10
     offset = (page-1)*per_page
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM users")
-        total = c.fetchone()[0]
-        c.execute("SELECT * FROM users ORDER BY joined_date DESC LIMIT ? OFFSET ?", (per_page, offset))
-        rows = c.fetchall()
+    async with Database._pool.acquire() as conn:
+        total = await conn.fetchval("SELECT COUNT(*) FROM users")
+        rows = await conn.fetch("SELECT * FROM users ORDER BY joined_date DESC LIMIT $1 OFFSET $2", per_page, offset)
     msg = f"**Users (page {page} / { (total+per_page-1)//per_page }):**\n"
     for r in rows:
         u = dict(r)
@@ -591,16 +666,10 @@ async def recent_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     days = 7
     if context.args and context.args[0].isdigit():
         days = int(context.args[0])
-    since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        c.execute("SELECT * FROM users WHERE last_activity >= ? ORDER BY last_activity DESC", (since,))
-        rows = c.fetchall()
+    rows = await Database.get_recent_users(days)
     msg = f"**Active users in last {days} days:** {len(rows)}\n"
-    for r in rows[:10]:  # show first 10
-        u = dict(r)
-        msg += f"🆔 `{u['user_id']}` | Last active: {u['last_activity'][:16]}\n"
+    for u in rows[:10]:
+        msg += f"🆔 `{u['user_id']}` | Last active: {u['last_activity'][:16] if u['last_activity'] else 'Never'}\n"
     if len(rows) > 10:
         msg += f"... and {len(rows)-10} more"
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
@@ -616,7 +685,7 @@ async def user_lookups(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         await update.message.reply_text("Invalid ID.")
         return
-    lookups = get_user_lookups(uid, 20)
+    lookups = await Database.get_user_lookups(uid, 20)
     if not lookups:
         await update.message.reply_text("No lookups found.")
         return
@@ -628,18 +697,10 @@ async def user_lookups(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin_filter(update, context):
         return
-    # Top users by lookup count
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        c.execute('''
-            SELECT user_id, COUNT(*) as cnt FROM lookups
-            GROUP BY user_id ORDER BY cnt DESC LIMIT 10
-        ''')
-        rows = c.fetchall()
+    rows = await Database.get_leaderboard(10)
     msg = "**🏆 Leaderboard (most lookups):**\n"
     for i, r in enumerate(rows, 1):
-        u = get_user(r['user_id'])
+        u = await Database.get_user(r['user_id'])
         name = f"@{u['username']}" if u and u.get('username') else str(r['user_id'])
         msg += f"{i}. {name} – {r['cnt']} lookups\n"
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
@@ -650,26 +711,13 @@ async def inactive_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     days = 30
     if context.args and context.args[0].isdigit():
         days = int(context.args[0])
-    since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM users WHERE last_activity < ? OR last_activity IS NULL", (since,))
-        cnt = c.fetchone()[0]
+    cnt = await Database.get_inactive_count(days)
     await update.message.reply_text(f"Inactive users (no activity in last {days} days): {cnt}")
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin_filter(update, context):
         return
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM users")
-        total_users = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM users WHERE is_banned = 1")
-        banned = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM lookups")
-        total_lookups = c.fetchone()[0]
-        c.execute("SELECT COUNT(DISTINCT user_id) FROM lookups")
-        active_users = c.fetchone()[0]
+    total_users, banned, total_lookups, active_users = await Database.get_stats()
     msg = (f"**Bot Statistics:**\n"
            f"👥 Total users: {total_users}\n"
            f"🚫 Banned: {banned}\n"
@@ -683,16 +731,7 @@ async def dailystats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     days = 7
     if context.args and context.args[0].isdigit():
         days = int(context.args[0])
-    data = []
-    for i in range(days):
-        day = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            c = conn.cursor()
-            c.execute('''
-                SELECT COUNT(*) FROM lookups WHERE DATE(timestamp) = ?
-            ''', (day,))
-            cnt = c.fetchone()[0]
-            data.append((day, cnt))
+    data = await Database.get_daily_lookups(days)
     msg = "**Daily Lookups (last {} days):**\n".format(days)
     for day, cnt in reversed(data):
         msg += f"{day}: {cnt}\n"
@@ -701,13 +740,7 @@ async def dailystats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def lookupstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin_filter(update, context):
         return
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        c = conn.cursor()
-        c.execute('''
-            SELECT command, COUNT(*) as cnt FROM lookups
-            GROUP BY command ORDER BY cnt DESC
-        ''')
-        rows = c.fetchall()
+    rows = await Database.get_lookup_stats_per_command()
     msg = "**Lookup statistics per command:**\n"
     for cmd, cnt in rows:
         msg += f"/{cmd}: {cnt}\n"
@@ -716,40 +749,46 @@ async def lookupstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin_filter(update, context):
         return
-    # /backup start_date end_date? Actually user said "time intervell dd/mm/yyyy to dd/mm/yyyy"
-    # We'll just generate full backup for simplicity, but can be extended.
-    # Generate CSV of users and lookups
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        c = conn.cursor()
-        c.execute("SELECT * FROM users")
-        users = c.fetchall()
-        col_names = [description[0] for description in c.description]
-
+    # Generate CSV of all users
+    users = await Database.get_all_users(include_banned=True)
+    if not users:
+        await update.message.reply_text("No users to backup.")
+        return
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(col_names)
-    writer.writerows(users)
+    # Write header
+    writer.writerow(users[0].keys())
+    for u in users:
+        writer.writerow(u.values())
     csv_data = output.getvalue().encode()
     await update.message.reply_document(document=csv_data, filename="users_backup.csv", caption="Users backup")
 
 async def fulldbbackup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin_filter(update, context):
         return
-    # Send the SQLite file and CSV
-    with open(DB_PATH, "rb") as f:
-        await update.message.reply_document(document=f, filename="bot_database.db", caption="Full SQLite DB")
-    # Also generate CSV
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        c = conn.cursor()
-        c.execute("SELECT * FROM users")
-        users = c.fetchall()
-        col_names = [description[0] for description in c.description]
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(col_names)
-    writer.writerows(users)
-    csv_data = output.getvalue().encode()
-    await update.message.reply_document(document=csv_data, filename="users_export.csv", caption="Users CSV")
+    # Since we use PostgreSQL, we can't send the raw file. Instead, send CSV exports.
+    # Users CSV
+    users = await Database.get_all_users(include_banned=True)
+    if users:
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(users[0].keys())
+        for u in users:
+            writer.writerow(u.values())
+        csv_data = output.getvalue().encode()
+        await update.message.reply_document(document=csv_data, filename="users_export.csv", caption="Users CSV")
+
+    # Lookups CSV (last 1000 for size)
+    async with Database._pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM lookups ORDER BY id DESC LIMIT 1000")
+    if rows:
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(rows[0].keys())
+        for r in rows:
+            writer.writerow(r.values())
+        csv_data = output.getvalue().encode()
+        await update.message.reply_document(document=csv_data, filename="lookups_export.csv", caption="Lookups CSV (last 1000)")
 
 async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
@@ -760,7 +799,7 @@ async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         uid = int(context.args[0])
-        set_admin(uid, True)
+        await Database.set_admin(uid, True)
         await update.message.reply_text(f"User {uid} is now admin.")
     except:
         await update.message.reply_text("Invalid ID.")
@@ -774,7 +813,7 @@ async def remove_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         uid = int(context.args[0])
-        set_admin(uid, False)
+        await Database.set_admin(uid, False)
         await update.message.reply_text(f"User {uid} is no longer admin.")
     except:
         await update.message.reply_text("Invalid ID.")
@@ -782,13 +821,10 @@ async def remove_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def list_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin_filter(update, context):
         return
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        c.execute("SELECT user_id, username FROM users WHERE is_admin = 1")
-        admins = c.fetchall()
+    async with Database._pool.acquire() as conn:
+        rows = await conn.fetch("SELECT user_id, username FROM users WHERE is_admin = 1")
     msg = "**Admins:**\n"
-    for a in admins:
+    for a in rows:
         msg += f"• `{a['user_id']}` (@{a.get('username','')})\n"
     msg += f"👑 Owner: `{OWNER_ID}`"
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
@@ -815,14 +851,10 @@ telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
 # ---------- Webhook Setup ----------
 @app.on_event("startup")
 async def on_startup():
+    await Database.init_pool()
     await telegram_app.initialize()
     # Set webhook
-    webhook_url = WEBHOOK_URL or os.environ.get("RENDER_EXTERNAL_URL")
-    if not webhook_url:
-        logger.error("WEBHOOK_URL not set!")
-        return
-    if not webhook_url.endswith("/webhook"):
-        webhook_url = webhook_url.rstrip('/') + "/webhook"
+    webhook_url = WEBHOOK_URL.rstrip('/') + "/webhook"
     await telegram_app.bot.set_webhook(url=webhook_url)
     logger.info(f"Webhook set to {webhook_url}")
 
@@ -830,6 +862,7 @@ async def on_startup():
 async def on_shutdown():
     await telegram_app.bot.delete_webhook()
     await telegram_app.shutdown()
+    await Database.close_pool()
 
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -844,5 +877,5 @@ async def health():
 
 # ---------- Main ----------
 if __name__ == "__main__":
-    init_db()
+    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=PORT)
