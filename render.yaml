@@ -21,4 +21,4 @@ services:
       - key: FORCE_CHANNEL2_LINK
         value: https://t.me/osint_lookup
       - key: WEBHOOK_URL
-        sync: WEBHOOK_URL = https://osintbot-2.onrender.com/webhook   # set to https://your-app.onrender.com/webhook after deploy
+        sync: https://osintbot-2.onrender.com/webhook   # set to https://your-app.onrender.com/webhook after deploy
