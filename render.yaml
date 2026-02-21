@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: telegram-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: BOT_OWNER_ID
+        value: 8104850843
+      - key: BOT_ADMIN_IDS
+        value: 8104850843,5987905091
+      - key: FORCE_CHNNEL1ID
+        value: -1003090922367
+      - key: FORCE_CHNNEL2ID
+        value: -1003698567122
+      - key: FORCE_CHANNEL1_LINK
+        value: https://t.me/all_data_here
+      - key: FORCE_CHANNEL2_LINK
+        value: https://t.me/osint_lookup
+      - key: WEBHOOK_URL
+        sync: false   # set to https://your-app.onrender.com/webhook after deploy
