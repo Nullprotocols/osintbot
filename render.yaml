@@ -1,24 +1,39 @@
+# render.yaml – Infrastructure as Code for Render
+# Deploy your bot and PostgreSQL database in one go.
+
 services:
   - type: web
-    name: telegram-bot
-    runtime: python
-    plan: free
+    name: telegram-bot-pro          # Change if desired
+    env: python
+    region: oregon                   # Choose region (oregon, frankfurt, singapore)
+    plan: free                       # Upgrade as needed
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    startCommand: python main.py
+    healthCheckPath: /                # FastAPI health endpoint
     envVars:
       - key: BOT_TOKEN
-        sync: false
+        # Replace with your actual bot token from @BotFather
+        value: "8386893309:AAEtAqzm0F1rwdTjrex0NP0gN_ax6rh1kQc"
       - key: BOT_OWNER_ID
-        value: 8104850843
+        value: "8104850843"
       - key: BOT_ADMIN_IDS
-        value: 8104850843,5987905091
-      - key: FORCE_CHNNEL1ID
-        value: -1003090922367
-      - key: FORCE_CHNNEL2ID
-        value: -1003698567122
+        value: "8104850843,5987905091"
+      - key: FORCE_CHANNEL1_ID
+        value: "-1003090922367"
+      - key: FORCE_CHANNEL2_ID
+        value: "-1003698567122"
       - key: FORCE_CHANNEL1_LINK
-        value: https://t.me/all_data_here
+        value: "https://t.me/all_data_here"
       - key: FORCE_CHANNEL2_LINK
-        value: https://t.me/osint_lookup
-      - key: WEBHOOK_URL
-        sync: https://osintbot-2.onrender.com/webhook   # set to https://your-app.onrender.com/webhook after deploy
+        value: "https://t.me/osint_lookup"
+      # Render will automatically inject the PostgreSQL connection string here
+      - key: DATABASE_URL
+        fromDatabase:
+          name: telegram-bot-db
+          property: connectionString
+    autoDeploy: true                  # Redeploy on every push to the branch
+
+databases:
+  - name: telegram-bot-db
+    databaseName: botdb               # Name of the database inside PostgreSQL
+    plan: free                         # Match the web service plan
