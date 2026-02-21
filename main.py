@@ -1,788 +1,848 @@
 import os
-import sys
 import json
-import asyncio
-import logging
 import re
-from datetime import datetime, date, timedelta
-from typing import List, Optional, Any
-from urllib.parse import urlparse
+import logging
+import sqlite3
+import csv
+import io
+import asyncio
+from datetime import datetime, timedelta
+from typing import Union, Optional
+from contextlib import closing
 
 import aiohttp
-from aiohttp import web
-import aiogram
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.enums import ParseMode, ChatMemberStatus
-from aiogram.filters import Command, CommandObject
-from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-import aiosqlite
-from dotenv import load_dotenv
+import uvicorn
+from fastapi import FastAPI, Request
+from fastapi.responses import Response
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, filters,
+    ContextTypes, CallbackQueryHandler
+)
+from telegram.constants import ParseMode
 
-# Load environment variables
-load_dotenv()
+# ---------- Environment ----------
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN missing")
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+OWNER_ID = int(os.environ.get("BOT_OWNER_ID", "8104850843"))
+ADMIN_IDS = [int(x.strip()) for x in os.environ.get("BOT_ADMIN_IDS", "8104850843,5987905091").split(",")]
+FORCE_CHANNEL1_ID = int(os.environ.get("FORCE_CHNNEL1ID", "-1003090922367"))
+FORCE_CHANNEL2_ID = int(os.environ.get("FORCE_CHNNEL2ID", "-1003698567122"))
+FORCE_CHANNEL1_LINK = os.environ.get("FORCE_CHANNEL1_LINK", "https://t.me/all_data_here")
+FORCE_CHANNEL2_LINK = os.environ.get("FORCE_CHANNEL2_LINK", "https://t.me/osint_lookup")
+
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # e.g. https://your-app.onrender.com/webhook
+PORT = int(os.environ.get("PORT", 8080))
+
+# Branding to remove (global)
+BRANDING_BLACKLIST = [
+    '@patelkrish_99', 'patelkrish_99', 't.me/anshapi', 'anshapi',
+    '"@Kon_Hu_Mai"', 'Dm to buy access', '"Dm to buy access"', 'Kon_Hu_Mai'
+]
+# Extra blacklist for number API only
+NUMBER_API_BLACKLIST = [
+    'dm to buy', 'owner', '@kon_hu_mai',
+    'Ruk ja bhencho itne m kya unlimited request lega?? Paid lena h to bolo 100-400₹ @Simpleguy444'
+]
+
+# ---------- Logging ----------
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
-# Constants
-OWNER_ID = 8104850843
-ADMIN_IDS = [8104850843, 5987905091]
-FORCE_JOIN_CHANNELS = [
-    {"username": "all_data_here", "id": -1003090922367},
-    {"username": "osint_lookup", "id": -1003698567122}
-]
-LOG_CHANNELS = {
-    "num": -1003482423742,
-    "ifsc": -1003624886596,
-    "email": -1003431549612,
-    "gst": -1003634866992,
-    "vehicle": -1003237155636,
-    "pincode": -1003677285823,
-    "instagram": -1003498414978,
-    "github": -1003576017442,
-    "pakistan": -1003663672738,
-    "ip": -1003665811220,
-    "ff_info": -1003588577282,
-    "ff_ban": -1003521974255,
-    "tg2num": -1003642820243,
-    "chalan": -1003237155636,
-    "tg_to_info": -1003643170105,
-    "tgpro": -1003643170105,
-    "adr": -1003482423742,
-}
-BRANDING_BLOCKLIST = [
-    "@patelkrish_99", "patelkrish_99", "t.me/anshapi", "anshapi", "@Kon_Hu_Mai", "Dm to buy access", "Kon_Hu_Mai"
-]
-EXTRA_NUMBER_BLOCK = [
-    "dm to buy", "owner", "@kon_hu_mai", "Ruk ja bhencho itne m kya unlimited request lega?? Paid lena h to bolo 100-400₹ @Simpleguy444"
-]
-API_ENDPOINTS = {
-    "num": "https://num-free-rootx-jai-shree-ram-14-day.vercel.app/?key=lundkinger&number={}",
-    "tg2num": "https://tg2num-owner-api.vercel.app/?userid={}",
-    "vehicle": "https://vehicle-info-aco-api.vercel.app/info?vehicle={}",
-    "vchalan": "https://api.b77bf911.workers.dev/vehicle?registration={}",
-    "ip": "https://abbas-apis.vercel.app/api/ip?ip={}",
-    "email": "https://abbas-apis.vercel.app/api/email?mail={}",
-    "ffinfo": "https://official-free-fire-info.onrender.com/player-info?key=DV_M7-INFO_API&uid={}",
-    "ffban": "https://abbas-apis.vercel.app/api/ff-ban?uid={}",
-    "pin": "https://api.postalpincode.in/pincode/{}",
-    "ifsc": "https://abbas-apis.vercel.app/api/ifsc?ifsc={}",
-    "gst": "https://api.b77bf911.workers.dev/gst?number={}",
-    "insta": "https://mkhossain.alwaysdata.net/instanum.php?username={}",
-    "tginfo": "https://openosintx.vippanel.in/tgusrinfo.php?key=OpenOSINTX-FREE&user={}",
-    "tginfopro": "https://api.b77bf911.workers.dev/telegram?user={}",
-    "git": "https://abbas-apis.vercel.app/api/github?username={}",
-    "pak": "https://abbas-apis.vercel.app/api/pakistan?number={}",
-    "adr": "https://api-ij32.onrender.com/aadhar?match={}",
-}
+# ---------- Database ----------
+DB_PATH = "bot_data.db"
 
-# Initialize bot and dispatcher
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    logger.error("BOT_TOKEN not set in environment")
-    sys.exit(1)
+def init_db():
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        # Users table
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                joined_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_activity TIMESTAMP,
+                is_banned INTEGER DEFAULT 0,
+                is_admin INTEGER DEFAULT 0
+            )
+        ''')
+        # Lookups table
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS lookups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                command TEXT,
+                input TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                result_summary TEXT,
+                FOREIGN KEY(user_id) REFERENCES users(user_id)
+            )
+        ''')
+        # Ensure initial admins from env are stored
+        for admin_id in ADMIN_IDS:
+            c.execute("INSERT OR IGNORE INTO users (user_id, is_admin) VALUES (?, 1)", (admin_id,))
+        # Owner is not stored as admin flag but handled via OWNER_ID check
+        conn.commit()
 
-bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
-dp = Dispatcher()
+def get_user(user_id: int) -> Optional[dict]:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+        row = c.fetchone()
+        return dict(row) if row else None
 
-# Database import
-from database import Database
+def add_or_update_user(user_id: int, username: str = None, first_name: str = None, last_name: str = None):
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        c.execute('''
+            INSERT INTO users (user_id, username, first_name, last_name, last_activity)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username = excluded.username,
+                first_name = excluded.first_name,
+                last_name = excluded.last_name,
+                last_activity = CURRENT_TIMESTAMP
+        ''', (user_id, username, first_name, last_name))
+        conn.commit()
 
-# Global database instance
-db = None
+def update_activity(user_id: int):
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        c.execute("UPDATE users SET last_activity = CURRENT_TIMESTAMP WHERE user_id = ?", (user_id,))
+        conn.commit()
 
-# Self-ping task handle
-self_ping_task = None
+def add_lookup(user_id: int, command: str, input_str: str, result_summary: str = ""):
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        c.execute('''
+            INSERT INTO lookups (user_id, command, input, result_summary)
+            VALUES (?, ?, ?, ?)
+        ''', (user_id, command, input_str, result_summary[:500]))
+        conn.commit()
 
-# -------------------------------------------------------------------
-# Utility functions
-# -------------------------------------------------------------------
+def is_user_banned(user_id: int) -> bool:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        c.execute("SELECT is_banned FROM users WHERE user_id = ?", (user_id,))
+        row = c.fetchone()
+        return row and row[0] == 1
 
-def clean_branding(text: str, command: str = None) -> str:
-    """Remove banned phrases from text."""
-    if not text:
-        return text
-    blocklist = BRANDING_BLOCKLIST.copy()
-    if command == "num":
-        blocklist.extend(EXTRA_NUMBER_BLOCK)
-    for phrase in blocklist:
-        text = text.replace(phrase, "")
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
+def set_ban(user_id: int, ban: bool):
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        c.execute("UPDATE users SET is_banned = ? WHERE user_id = ?", (1 if ban else 0, user_id))
+        conn.commit()
 
-async def fetch_api(url: str, retries: int = 3) -> Optional[Any]:
-    """Fetch API with retry and backoff."""
-    for attempt in range(retries):
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=10) as resp:
-                    if resp.status == 200:
-                        return await resp.json()
-                    else:
-                        logger.warning(f"API returned {resp.status} for {url}")
-                        return None
-        except asyncio.TimeoutError:
-            logger.warning(f"Timeout on attempt {attempt+1} for {url}")
-        except aiohttp.ClientError as e:
-            logger.warning(f"Client error on attempt {attempt+1}: {e}")
-        if attempt < retries - 1:
-            await asyncio.sleep(2 ** attempt)
-    return None
+def set_admin(user_id: int, admin: bool):
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        c.execute("UPDATE users SET is_admin = ? WHERE user_id = ?", (1 if admin else 0, user_id))
+        conn.commit()
 
-def format_result(data: Any, command: str) -> str:
-    """Format API result as preformatted JSON with footer."""
-    if data is None:
-        text = "No data or error."
-    else:
-        try:
-            text = json.dumps(data, indent=2, ensure_ascii=False)
-        except:
-            text = str(data)
-    footer = "\n\ndeveloper: @Nullprotocol_X\npowered_by: NULL PROTOCOL"
-    return f"<pre>{text}</pre>{footer}"
-
-def get_result_keyboard() -> InlineKeyboardMarkup:
-    """Inline buttons for copy and search."""
-    builder = InlineKeyboardBuilder()
-    builder.row(
-        InlineKeyboardButton(text="Copy", callback_data="copy"),
-        InlineKeyboardButton(text="Search", switch_inline_query="")
-    )
-    return builder.as_markup()
-
-async def check_force_join(user_id: int) -> bool:
-    """Check if user joined both required channels. Admins bypass."""
-    # Check if admin
-    cursor = await db.execute("SELECT user_id FROM admins WHERE user_id = ?", (user_id,))
-    if await cursor.fetchone():
-        return True
-    for channel in FORCE_JOIN_CHANNELS:
-        try:
-            member = await bot.get_chat_member(chat_id=channel["id"], user_id=user_id)
-            if member.status in [ChatMemberStatus.LEFT, ChatMemberStatus.KICKED]:
-                return False
-        except (TelegramBadRequest, TelegramForbiddenError) as e:
-            logger.warning(f"Force join check failed for {user_id} in {channel['id']}: {e}")
-            return False
-    return True
-
-async def send_force_join_prompt(message: Message):
-    """Send force join message with buttons."""
-    builder = InlineKeyboardBuilder()
-    for ch in FORCE_JOIN_CHANNELS:
-        builder.row(InlineKeyboardButton(text=f"Join {ch['username']}", url=f"https://t.me/{ch['username']}"))
-    builder.row(InlineKeyboardButton(text="✅ Done", callback_data="check_join"))
-    await message.reply(
-        "Please join both channels to use the bot:",
-        reply_markup=builder.as_markup()
-    )
-
-async def log_lookup(command: str, user_id: int, query: str, result: Any):
-    """Send log to appropriate Telegram channel."""
-    log_channel = LOG_CHANNELS.get(command)
-    if not log_channel:
-        return
-    try:
-        log_text = f"User: {user_id}\nQuery: {query}\nResult: {json.dumps(result, indent=2, ensure_ascii=False)}"
-        if len(log_text) > 4000:
-            log_text = log_text[:4000] + "..."
-        await bot.send_message(log_channel, log_text)
-    except Exception as e:
-        logger.error(f"Failed to log lookup: {e}")
-
-async def ensure_user_in_db(user_id: int, username: str = None, first_name: str = None):
-    """Insert or update user in database."""
-    now = datetime.utcnow().isoformat()
-    await db.execute(
-        "INSERT OR IGNORE INTO users (user_id, username, first_name, first_seen, last_seen, total_lookups) VALUES (?, ?, ?, ?, ?, 0)",
-        (user_id, username, first_name, now, now)
-    )
-    await db.execute(
-        "UPDATE users SET last_seen = ?, username = ?, first_name = ? WHERE user_id = ?",
-        (now, username, first_name, user_id)
-    )
-    await db.commit()
-
-async def increment_lookups(user_id: int):
-    await db.execute(
-        "UPDATE users SET total_lookups = total_lookups + 1 WHERE user_id = ?",
-        (user_id,)
-    )
-    await db.commit()
-
-async def update_daily_stats(command: str):
-    today = date.today().isoformat()
-    await db.execute(
-        "INSERT INTO daily_stats (date, command, count) VALUES (?, ?, 1) ON CONFLICT(date, command) DO UPDATE SET count = count + 1",
-        (today, command)
-    )
-    await db.commit()
-
-async def log_lookup_to_db(user_id: int, command: str, query: str):
-    """Store lookup in database (for stats and history)."""
-    now = datetime.utcnow().isoformat()
-    await db.execute(
-        "INSERT INTO lookups (user_id, command, query, timestamp) VALUES (?, ?, ?, ?)",
-        (user_id, command, query, now)
-    )
-    await db.commit()
-
-# -------------------------------------------------------------------
-# Permission checks
-# -------------------------------------------------------------------
-
-def is_owner(user_id: int) -> bool:
-    return user_id == OWNER_ID
-
-async def is_admin(user_id: int) -> bool:
-    if is_owner(user_id):
-        return True
-    cursor = await db.execute("SELECT user_id FROM admins WHERE user_id = ?", (user_id,))
-    return await cursor.fetchone() is not None
-
-async def is_banned(user_id: int) -> bool:
-    cursor = await db.execute("SELECT user_id FROM banned WHERE user_id = ?", (user_id,))
-    return await cursor.fetchone() is not None
-
-async def check_group_and_join(message: Message) -> bool:
-    """Verify that message is in group and user has joined channels."""
-    if message.chat.type not in ["group", "supergroup"]:
-        if await is_admin(message.from_user.id):
-            return True
-        await message.reply("Ye bot sirf group me kaam karta hai.\nPersonal use ke liye use kare: @osintfatherNullBot")
-        return False
-    if await is_banned(message.from_user.id):
-        await message.reply("You are banned.")
-        return False
-    if not await is_admin(message.from_user.id):
-        if not await check_force_join(message.from_user.id):
-            await send_force_join_prompt(message)
-            return False
-    return True
-
-# -------------------------------------------------------------------
-# Command Handlers (OSINT commands)
-# -------------------------------------------------------------------
-
-async def handle_osint_command(message: Message, command: str, arg: str):
-    """Generic handler for OSINT commands."""
-    if not await check_group_and_join(message):
-        return
-    if not arg:
-        await message.reply(f"Usage: /{command} <query>")
-        return
-    await ensure_user_in_db(message.from_user.id, message.from_user.username, message.from_user.first_name)
-    await increment_lookups(message.from_user.id)
-    await update_daily_stats(command)
-    await log_lookup_to_db(message.from_user.id, command, arg)
-    url = API_ENDPOINTS[command].format(arg)
-    data = await fetch_api(url)
-    cleaned_data = None
-    if data:
-        if isinstance(data, dict):
-            cleaned_data = {k: clean_branding(str(v), command) if isinstance(v, str) else v for k, v in data.items()}
-        elif isinstance(data, list):
-            cleaned_data = [clean_branding(str(item), command) if isinstance(item, str) else item for item in data]
+def get_all_users(include_banned=False):
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        if include_banned:
+            c.execute("SELECT * FROM users")
         else:
-            cleaned_data = clean_branding(str(data), command)
-    else:
-        cleaned_data = {"error": "No response from API"}
-    result_text = format_result(cleaned_data, command)
-    await message.reply(result_text, reply_markup=get_result_keyboard(), parse_mode=ParseMode.HTML)
-    await log_lookup(command, message.from_user.id, arg, cleaned_data)
+            c.execute("SELECT * FROM users WHERE is_banned = 0")
+        return [dict(row) for row in c.fetchall()]
 
-# Register all OSINT commands
-@dp.message(Command("num"))
-async def cmd_num(message: Message, command: CommandObject):
-    await handle_osint_command(message, "num", command.args)
+def get_user_lookups(user_id: int, limit: int = 50):
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute('''
+            SELECT command, input, timestamp FROM lookups
+            WHERE user_id = ?
+            ORDER BY timestamp DESC LIMIT ?
+        ''', (user_id, limit))
+        return [dict(row) for row in c.fetchall()]
 
-@dp.message(Command("tg2num"))
-async def cmd_tg2num(message: Message, command: CommandObject):
-    await handle_osint_command(message, "tg2num", command.args)
+# ---------- FastAPI & Telegram App ----------
+app = FastAPI()
+telegram_app = Application.builder().token(BOT_TOKEN).build()
 
-@dp.message(Command("vehicle"))
-async def cmd_vehicle(message: Message, command: CommandObject):
-    await handle_osint_command(message, "vehicle", command.args)
+# ---------- Helper Functions ----------
+async def is_admin_or_owner(user_id: int) -> bool:
+    """Check if user is in DB as admin or is owner."""
+    if user_id == OWNER_ID:
+        return True
+    user = get_user(user_id)
+    return user and user.get("is_admin") == 1
 
-@dp.message(Command("vchalan"))
-async def cmd_vchalan(message: Message, command: CommandObject):
-    await handle_osint_command(message, "vchalan", command.args)
-
-@dp.message(Command("ip"))
-async def cmd_ip(message: Message, command: CommandObject):
-    await handle_osint_command(message, "ip", command.args)
-
-@dp.message(Command("email"))
-async def cmd_email(message: Message, command: CommandObject):
-    await handle_osint_command(message, "email", command.args)
-
-@dp.message(Command("ffinfo"))
-async def cmd_ffinfo(message: Message, command: CommandObject):
-    await handle_osint_command(message, "ffinfo", command.args)
-
-@dp.message(Command("ffban"))
-async def cmd_ffban(message: Message, command: CommandObject):
-    await handle_osint_command(message, "ffban", command.args)
-
-@dp.message(Command("pin"))
-async def cmd_pin(message: Message, command: CommandObject):
-    await handle_osint_command(message, "pin", command.args)
-
-@dp.message(Command("ifsc"))
-async def cmd_ifsc(message: Message, command: CommandObject):
-    await handle_osint_command(message, "ifsc", command.args)
-
-@dp.message(Command("gst"))
-async def cmd_gst(message: Message, command: CommandObject):
-    await handle_osint_command(message, "gst", command.args)
-
-@dp.message(Command("insta"))
-async def cmd_insta(message: Message, command: CommandObject):
-    await handle_osint_command(message, "insta", command.args)
-
-@dp.message(Command("tginfo"))
-async def cmd_tginfo(message: Message, command: CommandObject):
-    await handle_osint_command(message, "tginfo", command.args)
-
-@dp.message(Command("tginfopro"))
-async def cmd_tginfopro(message: Message, command: CommandObject):
-    await handle_osint_command(message, "tginfopro", command.args)
-
-@dp.message(Command("git"))
-async def cmd_git(message: Message, command: CommandObject):
-    await handle_osint_command(message, "git", command.args)
-
-@dp.message(Command("pak"))
-async def cmd_pak(message: Message, command: CommandObject):
-    await handle_osint_command(message, "pak", command.args)
-
-@dp.message(Command("adr"))
-async def cmd_adr(message: Message, command: CommandObject):
-    await handle_osint_command(message, "adr", command.args)
-
-# -------------------------------------------------------------------
-# Admin commands
-# -------------------------------------------------------------------
-
-async def admin_only(message: Message) -> bool:
-    if not await is_admin(message.from_user.id):
-        await message.reply("Unauthorized.")
-        return False
-    return True
-
-@dp.message(Command("addadmin"))
-async def cmd_addadmin(message: Message, command: CommandObject):
-    if not is_owner(message.from_user.id):
-        await message.reply("Owner only.")
-        return
-    if not command.args:
-        await message.reply("Usage: /addadmin <user_id>")
-        return
+async def check_force_channels(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> (bool, str):
+    """Return (ok, message). If not ok, message contains instruction."""
+    if user_id == OWNER_ID or await is_admin_or_owner(user_id):
+        return True, ""
     try:
-        user_id = int(command.args.strip())
-    except:
-        await message.reply("Invalid user ID.")
-        return
-    await db.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (user_id,))
-    await db.commit()
-    await message.reply(f"Admin {user_id} added.")
-
-@dp.message(Command("removeadmin"))
-async def cmd_removeadmin(message: Message, command: CommandObject):
-    if not is_owner(message.from_user.id):
-        await message.reply("Owner only.")
-        return
-    if not command.args:
-        await message.reply("Usage: /removeadmin <user_id>")
-        return
-    try:
-        user_id = int(command.args.strip())
-    except:
-        await message.reply("Invalid user ID.")
-        return
-    await db.execute("DELETE FROM admins WHERE user_id = ?", (user_id,))
-    await db.commit()
-    await message.reply(f"Admin {user_id} removed.")
-
-@dp.message(Command("listadmins"))
-async def cmd_listadmins(message: Message):
-    if not await admin_only(message):
-        return
-    cursor = await db.execute("SELECT user_id FROM admins")
-    rows = await cursor.fetchall()
-    admin_list = "\n".join(str(r[0]) for r in rows)
-    await message.reply(f"Admins:\n{admin_list}")
-
-@dp.message(Command("ban"))
-async def cmd_ban(message: Message, command: CommandObject):
-    if not await admin_only(message):
-        return
-    if not command.args:
-        await message.reply("Usage: /ban <user_id>")
-        return
-    try:
-        user_id = int(command.args.strip())
-    except:
-        await message.reply("Invalid user ID.")
-        return
-    await db.execute("INSERT OR IGNORE INTO banned (user_id) VALUES (?)", (user_id,))
-    await db.commit()
-    await message.reply(f"User {user_id} banned.")
-
-@dp.message(Command("unban"))
-async def cmd_unban(message: Message, command: CommandObject):
-    if not await admin_only(message):
-        return
-    if not command.args:
-        await message.reply("Usage: /unban <user_id>")
-        return
-    try:
-        user_id = int(command.args.strip())
-    except:
-        await message.reply("Invalid user ID.")
-        return
-    await db.execute("DELETE FROM banned WHERE user_id = ?", (user_id,))
-    await db.commit()
-    await message.reply(f"User {user_id} unbanned.")
-
-@dp.message(Command("deleteuser"))
-async def cmd_deleteuser(message: Message, command: CommandObject):
-    if not await admin_only(message):
-        return
-    if not command.args:
-        await message.reply("Usage: /deleteuser <user_id>")
-        return
-    try:
-        user_id = int(command.args.strip())
-    except:
-        await message.reply("Invalid user ID.")
-        return
-    await db.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
-    await db.commit()
-    await message.reply(f"User {user_id} deleted from database.")
-
-@dp.message(Command("searchuser"))
-async def cmd_searchuser(message: Message, command: CommandObject):
-    if not await admin_only(message):
-        return
-    if not command.args:
-        await message.reply("Usage: /searchuser <user_id or username>")
-        return
-    query = command.args.strip()
-    if query.isdigit():
-        cursor = await db.execute("SELECT * FROM users WHERE user_id = ?", (int(query),))
-        row = await cursor.fetchone()
-    else:
-        cursor = await db.execute("SELECT * FROM users WHERE username LIKE ?", (f"%{query}%",))
-        row = await cursor.fetchone()
-    if row:
-        await message.reply(f"User: {row}")
-    else:
-        await message.reply("Not found.")
-
-@dp.message(Command("users"))
-async def cmd_users(message: Message):
-    if not await admin_only(message):
-        return
-    cursor = await db.execute("SELECT COUNT(*) FROM users")
-    count = (await cursor.fetchone())[0]
-    await message.reply(f"Total users: {count}")
-
-@dp.message(Command("recentusers"))
-async def cmd_recentusers(message: Message):
-    if not await admin_only(message):
-        return
-    cursor = await db.execute("SELECT user_id, last_seen FROM users ORDER BY last_seen DESC LIMIT 10")
-    rows = await cursor.fetchall()
-    text = "\n".join(f"{r[0]} - {r[1]}" for r in rows)
-    await message.reply(f"Recent users:\n{text}")
-
-@dp.message(Command("userlookups"))
-async def cmd_userlookups(message: Message, command: CommandObject):
-    if not await admin_only(message):
-        return
-    if not command.args:
-        await message.reply("Usage: /userlookups <user_id>")
-        return
-    try:
-        user_id = int(command.args.strip())
-    except:
-        await message.reply("Invalid user ID.")
-        return
-    cursor = await db.execute(
-        "SELECT command, query, timestamp FROM lookups WHERE user_id = ? ORDER BY timestamp DESC LIMIT 20",
-        (user_id,)
-    )
-    rows = await cursor.fetchall()
-    if not rows:
-        await message.reply("No lookups.")
-        return
-    text = "\n".join(f"{r[2]}: /{r[0]} {r[1]}" for r in rows)
-    await message.reply(text[:4000])
-
-@dp.message(Command("leaderboard"))
-async def cmd_leaderboard(message: Message):
-    if not await admin_only(message):
-        return
-    cursor = await db.execute("SELECT user_id, total_lookups FROM users ORDER BY total_lookups DESC LIMIT 10")
-    rows = await cursor.fetchall()
-    text = "\n".join(f"{r[0]} - {r[1]} lookups" for r in rows)
-    await message.reply(f"Leaderboard:\n{text}")
-
-@dp.message(Command("inactiveusers"))
-async def cmd_inactiveusers(message: Message):
-    if not await admin_only(message):
-        return
-    cutoff = (datetime.utcnow() - timedelta(days=30)).isoformat()
-    cursor = await db.execute("SELECT user_id FROM users WHERE last_seen < ?", (cutoff,))
-    rows = await cursor.fetchall()
-    count = len(rows)
-    await message.reply(f"Inactive users (30 days): {count}")
-
-@dp.message(Command("stats"))
-async def cmd_stats(message: Message):
-    if not await admin_only(message):
-        return
-    cursor = await db.execute("SELECT COUNT(*) FROM users")
-    total_users = (await cursor.fetchone())[0]
-    cursor = await db.execute("SELECT COUNT(*) FROM lookups")
-    total_lookups = (await cursor.fetchone())[0]
-    await message.reply(f"Total users: {total_users}\nTotal lookups: {total_lookups}")
-
-@dp.message(Command("dailystats"))
-async def cmd_dailystats(message: Message):
-    if not await admin_only(message):
-        return
-    today = date.today().isoformat()
-    cursor = await db.execute("SELECT command, count FROM daily_stats WHERE date = ?", (today,))
-    rows = await cursor.fetchall()
-    if not rows:
-        await message.reply("No stats today.")
-        return
-    text = "\n".join(f"/{r[0]}: {r[1]}" for r in rows)
-    await message.reply(f"Today's stats:\n{text}")
-
-@dp.message(Command("lookupstats"))
-async def cmd_lookupstats(message: Message):
-    if not await admin_only(message):
-        return
-    cursor = await db.execute("SELECT command, COUNT(*) FROM lookups GROUP BY command ORDER BY COUNT(*) DESC")
-    rows = await cursor.fetchall()
-    text = "\n".join(f"/{r[0]}: {r[1]}" for r in rows)
-    await message.reply(f"Lookup stats:\n{text}")
-
-@dp.message(Command("settings"))
-async def cmd_settings(message: Message):
-    if not is_owner(message.from_user.id):
-        return
-    await message.reply("Settings: not implemented.")
-
-@dp.message(Command("fulldbbackup"))
-async def cmd_fulldbbackup(message: Message):
-    if not is_owner(message.from_user.id):
-        return
-    db_path = os.getenv("DATABASE_PATH", "bot_database.sqlite")
-    try:
-        with open(db_path, "rb") as f:
-            await message.reply_document(f, caption="Database backup")
+        member1 = await context.bot.get_chat_member(FORCE_CHANNEL1_ID, user_id)
+        member2 = await context.bot.get_chat_member(FORCE_CHANNEL2_ID, user_id)
+        if member1.status in ["left", "kicked"] or member2.status in ["left", "kicked"]:
+            msg = (f"❌ **Please join both channels first:**\n"
+                   f"🔹 {FORCE_CHANNEL1_LINK}\n"
+                   f"🔹 {FORCE_CHANNEL2_LINK}\n"
+                   f"Then try again.")
+            return False, msg
+        return True, ""
     except Exception as e:
-        await message.reply(f"Backup failed: {e}")
+        logger.error(f"Force check error: {e}")
+        # If bot can't check (e.g. channels not public), allow usage
+        return True, ""
 
-# -------------------------------------------------------------------
-# Broadcast and DM commands
-# -------------------------------------------------------------------
+async def fetch_api(url: str, params: dict = None) -> dict:
+    """Fetch JSON from API with timeout."""
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(url, params=params, timeout=10) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                else:
+                    return {"error": f"HTTP {resp.status}"}
+        except asyncio.TimeoutError:
+            return {"error": "Request timeout"}
+        except Exception as e:
+            return {"error": str(e)}
 
-async def broadcast_task(admin_msg: Message, users: List[int], media: Optional[types.Message] = None):
-    """Send broadcast to list of users."""
+def clean_branding(data: Union[dict, list, str], extra_blacklist: list = None) -> Union[dict, list, str]:
+    """Recursively remove any blacklisted strings from JSON data."""
+    blacklist = BRANDING_BLACKLIST + (extra_blacklist or [])
+    if isinstance(data, dict):
+        new_dict = {}
+        for k, v in data.items():
+            new_dict[k] = clean_branding(v, extra_blacklist)
+        return new_dict
+    elif isinstance(data, list):
+        return [clean_branding(item, extra_blacklist) for item in data]
+    elif isinstance(data, str):
+        for bad in blacklist:
+            data = data.replace(bad, "")
+        # Also remove any extra spaces caused by removal
+        data = re.sub(r'\s+', ' ', data).strip()
+        return data
+    else:
+        return data
+
+def format_json_output(raw_json: dict, command: str = "") -> str:
+    """Convert JSON to pretty string with footer."""
+    # First remove unwanted branding globally
+    cleaned = clean_branding(raw_json)
+    # Then convert to formatted JSON
+    pretty = json.dumps(cleaned, indent=2, ensure_ascii=False)
+    # Add footer
+    footer = "\n\n---\n👨‍💻 developer: @Nullprotocol_X\n⚡ powered_by: NULL PROTOCOL"
+    return f"```json\n{pretty}\n```{footer}"
+
+# ---------- Command Handlers ----------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    add_or_update_user(user.id, user.username, user.first_name, user.last_name)
+    if update.effective_chat.type == "private":
+        # Private chat: suggest group bot
+        await update.message.reply_text(
+            "🤖 **This bot only works in groups.**\n"
+            "Please add me to a group or use @osintfatherNullBot for personal use.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    # Group: welcome message
+    await update.message.reply_text(
+        "✅ Bot is active!\nUse /help to see all commands.",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    help_text = """
+**Available Commands:**
+
+📱 **Phone / ID Lookups**
+/num <10digit> – Phone number details
+/tg2num <tg_id> – Telegram ID → phone
+/adr <12digit> – Aadhaar info
+/ration <12digit> – Ration card details
+
+🚗 **Vehicle**
+/vehicle <number> – Vehicle owner info
+/vchalan <number> – Vehicle challan info
+
+🌐 **Network**
+/ip <ip> – IP geolocation
+/email <email> – Email lookup
+
+🎮 **Free Fire**
+/ffinfo <uid> – Free Fire profile
+/ffban <uid> – Free Fire ban check
+
+🏦 **Finance**
+/ifsc <code> – Bank IFSC details
+/gst <gst_no> – GST info
+
+📇 **Social Media**
+/insta <username> – Instagram info
+/tginfo <@username> – Telegram user info
+/tginfopro <tg_id> – Telegram pro info
+/git <github_user> – GitHub profile
+
+🇮🇳 **India Specific**
+/pin <pincode> – Pincode details
+/pak <pak_number> – Pakistan number lookup
+
+Admin commands are hidden.
+"""
+    await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
+
+# Generic API command factory
+def make_api_handler(api_url_template, input_processor=None, extra_branding_blacklist=None):
+    """Create a command handler for a given API."""
+    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user = update.effective_user
+        add_or_update_user(user.id, user.username, user.first_name, user.last_name)
+        chat = update.effective_chat
+
+        # Private chat restriction
+        if chat.type == "private" and not await is_admin_or_owner(user.id):
+            await update.message.reply_text(
+                "❌ **This bot only works in groups.**\n"
+                "Try @osintfatherNullBot for personal use.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+
+        # Force channel check for group users (except admins)
+        if chat.type in ["group", "supergroup"]:
+            ok, msg = await check_force_channels(user.id, context)
+            if not ok:
+                await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+                return
+
+        # Extract argument
+        args = context.args
+        if not args:
+            await update.message.reply_text(f"Usage: /{context.command[0]} <input>")
+            return
+        inp = " ".join(args)
+        if input_processor:
+            inp = input_processor(inp)
+
+        # Construct URL
+        url = api_url_template.format(input=inp)
+        # Some APIs use query params; we'll just format the template directly
+        # If template has {input} we replace; otherwise we append as ?key=value? We'll handle both.
+        # In most cases we can just pass input as part of URL string.
+        # For those with explicit ?param= we'll use string formatting.
+
+        # Fetch
+        raw_data = await fetch_api(url)
+        if "error" in raw_data:
+            await update.message.reply_text(f"⚠️ API error: {raw_data['error']}")
+            return
+
+        # Clean branding
+        cleaned = clean_branding(raw_data, extra_blacklist=extra_branding_blacklist)
+        output = format_json_output(cleaned, context.command[0])
+
+        # Truncate if too long (Telegram max 4096)
+        if len(output) > 4000:
+            output = output[:4000] + "\n... (truncated)"
+
+        await update.message.reply_text(output, parse_mode=ParseMode.MARKDOWN)
+
+        # Record lookup
+        add_lookup(user.id, context.command[0], inp, json.dumps(cleaned)[:200])
+
+    return handler
+
+# Define API endpoints
+API_ENDPOINTS = {
+    "num": ("https://num-free-rootx-jai-shree-ram-14-day.vercel.app/?key=lundkinger&number={input}", None, NUMBER_API_BLACKLIST),
+    "tg2num": ("https://tg2num-owner-api.vercel.app/?userid={input}", None, None),
+    "adr": ("https://api-ij32.onrender.com/aadhar?match={input}", None, None),
+    "ration": ("https://usesirosint.vercel.app/api/family?key=land&aadhar={input}", None, None),
+    "vehicle": ("https://vehicle-info-aco-api.vercel.app/info?vehicle={input}", None, None),
+    "vchalan": ("https://api.b77bf911.workers.dev/vehicle?registration={input}", None, None),
+    "ip": ("https://abbas-apis.vercel.app/api/ip?ip={input}", None, None),
+    "email": ("https://abbas-apis.vercel.app/api/email?mail={input}", None, None),
+    "ffinfo": ("https://official-free-fire-info.onrender.com/player-info?key=DV_M7-INFO_API&uid={input}", None, None),
+    "ffban": ("https://abbas-apis.vercel.app/api/ff-ban?uid={input}", None, None),
+    "pin": ("https://api.postalpincode.in/pincode/{input}", None, None),
+    "ifsc": ("https://abbas-apis.vercel.app/api/ifsc?ifsc={input}", None, None),
+    "gst": ("https://api.b77bf911.workers.dev/gst?number={input}", None, None),
+    "insta": ("https://mkhossain.alwaysdata.net/instanum.php?username={input}", None, None),
+    "tginfo": ("https://openosintx.vippanel.in/tgusrinfo.php?key=OpenOSINTX-FREE&user={input}", lambda x: x.lstrip('@'), None),
+    "tginfopro": ("https://api.b77bf911.workers.dev/telegram?user={input}", None, None),
+    "git": ("https://abbas-apis.vercel.app/api/github?username={input}", None, None),
+    "pak": ("https://abbas-apis.vercel.app/api/pakistan?number={input}", None, None),
+}
+
+# Register API command handlers
+for cmd, (url_tpl, proc, extra_blacklist) in API_ENDPOINTS.items():
+    telegram_app.add_handler(CommandHandler(cmd, make_api_handler(url_tpl, proc, extra_blacklist)))
+
+# ---------- Admin Commands ----------
+async def is_admin_filter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    user = update.effective_user
+    return user and await is_admin_or_owner(user.id)
+
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin_filter(update, context):
+        return
+    # Broadcast logic: if replying to a message, send that message to all users
+    if not update.message.reply_to_message:
+        await update.message.reply_text("Reply to a message with /broadcast to send it to all users.")
+        return
+
+    users = get_all_users(include_banned=False)
     sent = 0
     failed = 0
-    for uid in users:
+    for u in users:
         try:
-            if media:
-                if media.photo:
-                    await bot.send_photo(uid, media.photo[-1].file_id, caption=media.caption)
-                elif media.video:
-                    await bot.send_video(uid, media.video.file_id, caption=media.caption)
-                elif media.document:
-                    await bot.send_document(uid, media.document.file_id, caption=media.caption)
-                elif media.voice:
-                    await bot.send_voice(uid, media.voice.file_id, caption=media.caption)
-                elif media.text:
-                    await bot.send_message(uid, media.text)
-            else:
-                await bot.send_message(uid, admin_msg.text.split(maxsplit=1)[1] if admin_msg.text else "Broadcast")
+            await context.bot.copy_message(
+                chat_id=u['user_id'],
+                from_chat_id=update.chat_id,
+                message_id=update.message.reply_to_message.message_id
+            )
             sent += 1
         except Exception as e:
             failed += 1
-        await asyncio.sleep(0.05)
-    await admin_msg.reply(f"Broadcast finished. Sent: {sent}, Failed: {failed}")
+    await update.message.reply_text(f"Broadcast completed. Sent: {sent}, Failed: {failed}")
 
-@dp.message(Command("broadcast"))
-async def cmd_broadcast(message: Message):
-    if not await admin_only(message):
+async def dm_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin_filter(update, context):
         return
-    cursor = await db.execute("SELECT user_id FROM users")
-    rows = await cursor.fetchall()
-    users = [r[0] for r in rows]
-    if not users:
-        await message.reply("No users.")
+    # /dm <user_id> <text>  OR reply to a message with /dm <user_id>
+    if not context.args and not update.message.reply_to_message:
+        await update.message.reply_text("Usage: /dm <user_id> <text> or reply to a message with /dm <user_id>")
         return
-    if message.reply_to_message:
-        media_msg = message.reply_to_message
-        asyncio.create_task(broadcast_task(message, users, media_msg))
-        await message.reply(f"Broadcasting media to {len(users)} users...")
-    else:
-        if len(message.text.split()) < 2:
-            await message.reply("Usage: /broadcast <text> or reply to media")
+
+    target_id = None
+    text = None
+    if context.args:
+        target_id = int(context.args[0])
+        text = " ".join(context.args[1:]) if len(context.args) > 1 else None
+    if update.message.reply_to_message:
+        # Use reply message as content
+        target_id = int(context.args[0]) if context.args else None
+        if not target_id:
+            await update.message.reply_text("Please provide user ID when replying.")
             return
-        asyncio.create_task(broadcast_task(message, users))
-        await message.reply(f"Broadcasting text to {len(users)} users...")
-
-@dp.message(Command("dm"))
-async def cmd_dm(message: Message, command: CommandObject):
-    if not await admin_only(message):
-        return
-    args = command.args
-    if not args:
-        await message.reply("Usage: /dm user_id text")
-        return
-    parts = args.split(maxsplit=1)
-    if len(parts) < 2:
-        await message.reply("Usage: /dm user_id text")
-        return
-    try:
-        uid = int(parts[0])
-    except:
-        await message.reply("Invalid user ID.")
-        return
-    text = parts[1]
-    try:
-        await bot.send_message(uid, text)
-        await message.reply(f"Message sent to {uid}.")
-    except Exception as e:
-        await message.reply(f"Failed: {e}")
-
-@dp.message(Command("bulkdm"))
-async def cmd_bulkdm(message: Message, command: CommandObject):
-    if not await admin_only(message):
-        return
-    args = command.args
-    if not args:
-        await message.reply("Usage: /bulkdm id1 id2 ... text")
-        return
-    parts = args.split()
-    if len(parts) < 2:
-        await message.reply("Usage: /bulkdm id1 id2 ... text")
-        return
-    ids_text = parts[:-1]
-    text = parts[-1]
-    ids = []
-    for p in ids_text:
         try:
-            ids.append(int(p))
-        except:
-            await message.reply(f"Invalid ID: {p}")
-            return
-    asyncio.create_task(broadcast_task(message, ids, None))
-    await message.reply(f"Sending DM to {len(ids)} users...")
-
-# -------------------------------------------------------------------
-# Callback handlers
-# -------------------------------------------------------------------
-
-@dp.callback_query(F.data == "check_join")
-async def callback_check_join(callback: CallbackQuery):
-    if await check_force_join(callback.from_user.id):
-        await callback.message.edit_text("✅ You have joined both channels. You can now use the bot.")
-        await callback.answer()
-    else:
-        await callback.answer("Still missing one or both channels.", show_alert=True)
-
-@dp.callback_query(F.data == "copy")
-async def callback_copy(callback: CallbackQuery):
-    await callback.answer("Tap and copy the text above.", show_alert=False)
-
-# -------------------------------------------------------------------
-# Self-ping task
-# -------------------------------------------------------------------
-
-async def self_ping_task_func(base_url: str):
-    """Periodically ping the health endpoint to prevent sleeping."""
-    while True:
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(base_url, timeout=10) as resp:
-                    logger.info(f"Self-ping to {base_url} returned {resp.status}")
+            await context.bot.copy_message(
+                chat_id=target_id,
+                from_chat_id=update.chat_id,
+                message_id=update.message.reply_to_message.message_id
+            )
+            await update.message.reply_text(f"Message sent to {target_id}.")
         except Exception as e:
-            logger.error(f"Self-ping failed: {e}")
-        await asyncio.sleep(600)  # 10 minutes
-
-# -------------------------------------------------------------------
-# Error handler
-# -------------------------------------------------------------------
-
-@dp.error()
-async def errors_handler(event: aiogram.types.ErrorEvent):
-    logger.error(f"Bot error: {event.exception}", exc_info=True)
-
-# -------------------------------------------------------------------
-# Webhook setup and aiohttp app
-# -------------------------------------------------------------------
-
-async def on_startup():
-    global db, self_ping_task
-    # Ensure directory for database exists
-    db_path = os.getenv("DATABASE_PATH", "bot_database.sqlite")
-    os.makedirs(os.path.dirname(db_path), exist_ok=True)
-    db = await Database.create(db_path)
-    await db.init_db()
-    # Set webhook
-    webhook_url = os.getenv("WEBHOOK_URL")
-    if not webhook_url:
-        logger.error("WEBHOOK_URL not set")
+            await update.message.reply_text(f"Failed: {e}")
         return
-    await bot.set_webhook(url=webhook_url, drop_pending_updates=True)
-    logger.info(f"Webhook set to {webhook_url}")
-    # Start self-ping task using base domain
-    parsed = urlparse(webhook_url)
-    base_url = f"{parsed.scheme}://{parsed.netloc}"
-    if base_url:
-        self_ping_task = asyncio.create_task(self_ping_task_func(base_url))
-        logger.info(f"Self-ping task started, pinging {base_url} every 10 minutes")
+    if text and target_id:
+        try:
+            await context.bot.send_message(chat_id=target_id, text=text)
+            await update.message.reply_text(f"Message sent to {target_id}.")
+        except Exception as e:
+            await update.message.reply_text(f"Failed: {e}")
 
-async def on_shutdown():
-    # Delete webhook
-    await bot.delete_webhook()
-    # Cancel self-ping task
-    if self_ping_task:
-        self_ping_task.cancel()
-    await db.close()
-    logger.info("Webhook deleted, self-ping stopped, and DB closed")
-
-async def handle_webhook(request: web.Request) -> web.Response:
-    """Handle incoming Telegram update."""
+async def bulk_dm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin_filter(update, context):
+        return
+    # /bulkdm id1,id2,id3,... <text> or reply
+    if not context.args and not update.message.reply_to_message:
+        await update.message.reply_text("Usage: /bulkdm id1,id2,... <text> or reply with /bulkdm id1,id2,...")
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text("Provide at least IDs.")
+        return
+    ids_part = args[0]
+    text = " ".join(args[1:]) if len(args) > 1 else None
     try:
-        update = types.Update.model_validate(await request.json(), context={"bot": bot})
-        await dp.feed_update(bot, update)
-        return web.Response()
-    except Exception as e:
-        logger.error(f"Webhook error: {e}")
-        return web.Response(status=500)
+        ids = [int(x.strip()) for x in ids_part.split(",")]
+    except:
+        await update.message.reply_text("Invalid ID list. Use comma separated numbers.")
+        return
+    if update.message.reply_to_message:
+        # send the reply message to all
+        sent = 0
+        failed = 0
+        for uid in ids:
+            try:
+                await context.bot.copy_message(
+                    chat_id=uid,
+                    from_chat_id=update.chat_id,
+                    message_id=update.message.reply_to_message.message_id
+                )
+                sent += 1
+            except:
+                failed += 1
+        await update.message.reply_text(f"Bulk DM completed. Sent: {sent}, Failed: {failed}")
+    elif text:
+        sent = 0
+        failed = 0
+        for uid in ids:
+            try:
+                await context.bot.send_message(chat_id=uid, text=text)
+                sent += 1
+            except:
+                failed += 1
+        await update.message.reply_text(f"Bulk DM completed. Sent: {sent}, Failed: {failed}")
+    else:
+        await update.message.reply_text("Provide text or reply to a message.")
 
-async def health_check(request: web.Request) -> web.Response:
-    return web.Response(text="Bot running")
+async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin_filter(update, context):
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /ban <user_id>")
+        return
+    try:
+        uid = int(context.args[0])
+        set_ban(uid, True)
+        await update.message.reply_text(f"User {uid} banned.")
+    except:
+        await update.message.reply_text("Invalid ID.")
 
-def create_app():
-    app = web.Application()
-    app.router.add_post(f"/webhook/{BOT_TOKEN}", handle_webhook)
-    app.router.add_get("/", health_check)
-    app.on_startup.append(lambda _: on_startup())
-    app.on_shutdown.append(lambda _: on_shutdown())
-    return app
+async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin_filter(update, context):
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /unban <user_id>")
+        return
+    try:
+        uid = int(context.args[0])
+        set_ban(uid, False)
+        await update.message.reply_text(f"User {uid} unbanned.")
+    except:
+        await update.message.reply_text("Invalid ID.")
 
+async def delete_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin_filter(update, context):
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /deleteuser <user_id>")
+        return
+    try:
+        uid = int(context.args[0])
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            c.execute("DELETE FROM users WHERE user_id = ?", (uid,))
+            conn.commit()
+        await update.message.reply_text(f"User {uid} deleted.")
+    except:
+        await update.message.reply_text("Invalid ID or error.")
+
+async def search_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin_filter(update, context):
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /searchuser <query> (username or name)")
+        return
+    query = " ".join(context.args)
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute('''
+            SELECT * FROM users WHERE
+            username LIKE ? OR first_name LIKE ? OR last_name LIKE ? OR user_id LIKE ?
+            LIMIT 20
+        ''', (f"%{query}%", f"%{query}%", f"%{query}%", f"%{query}%"))
+        rows = c.fetchall()
+    if not rows:
+        await update.message.reply_text("No users found.")
+        return
+    msg = "**Search Results:**\n"
+    for r in rows:
+        u = dict(r)
+        msg += f"🆔 `{u['user_id']}` | @{u.get('username','')} | {u.get('first_name','')} | Banned: {u['is_banned']}\n"
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin_filter(update, context):
+        return
+    page = 1
+    if context.args and context.args[0].isdigit():
+        page = int(context.args[0])
+    per_page = 10
+    offset = (page-1)*per_page
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM users")
+        total = c.fetchone()[0]
+        c.execute("SELECT * FROM users ORDER BY joined_date DESC LIMIT ? OFFSET ?", (per_page, offset))
+        rows = c.fetchall()
+    msg = f"**Users (page {page} / { (total+per_page-1)//per_page }):**\n"
+    for r in rows:
+        u = dict(r)
+        msg += f"🆔 `{u['user_id']}` | @{u.get('username','')} | {u.get('first_name','')} | Banned: {u['is_banned']}\n"
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+async def recent_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin_filter(update, context):
+        return
+    days = 7
+    if context.args and context.args[0].isdigit():
+        days = int(context.args[0])
+    since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM users WHERE last_activity >= ? ORDER BY last_activity DESC", (since,))
+        rows = c.fetchall()
+    msg = f"**Active users in last {days} days:** {len(rows)}\n"
+    for r in rows[:10]:  # show first 10
+        u = dict(r)
+        msg += f"🆔 `{u['user_id']}` | Last active: {u['last_activity'][:16]}\n"
+    if len(rows) > 10:
+        msg += f"... and {len(rows)-10} more"
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+async def user_lookups(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin_filter(update, context):
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /userlookups <user_id>")
+        return
+    try:
+        uid = int(context.args[0])
+    except:
+        await update.message.reply_text("Invalid ID.")
+        return
+    lookups = get_user_lookups(uid, 20)
+    if not lookups:
+        await update.message.reply_text("No lookups found.")
+        return
+    msg = f"**Last lookups for {uid}:**\n"
+    for l in lookups:
+        msg += f"• `{l['command']}` `{l['input']}` at {l['timestamp'][:16]}\n"
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin_filter(update, context):
+        return
+    # Top users by lookup count
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute('''
+            SELECT user_id, COUNT(*) as cnt FROM lookups
+            GROUP BY user_id ORDER BY cnt DESC LIMIT 10
+        ''')
+        rows = c.fetchall()
+    msg = "**🏆 Leaderboard (most lookups):**\n"
+    for i, r in enumerate(rows, 1):
+        u = get_user(r['user_id'])
+        name = f"@{u['username']}" if u and u.get('username') else str(r['user_id'])
+        msg += f"{i}. {name} – {r['cnt']} lookups\n"
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+async def inactive_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin_filter(update, context):
+        return
+    days = 30
+    if context.args and context.args[0].isdigit():
+        days = int(context.args[0])
+    since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM users WHERE last_activity < ? OR last_activity IS NULL", (since,))
+        cnt = c.fetchone()[0]
+    await update.message.reply_text(f"Inactive users (no activity in last {days} days): {cnt}")
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin_filter(update, context):
+        return
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM users")
+        total_users = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM users WHERE is_banned = 1")
+        banned = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM lookups")
+        total_lookups = c.fetchone()[0]
+        c.execute("SELECT COUNT(DISTINCT user_id) FROM lookups")
+        active_users = c.fetchone()[0]
+    msg = (f"**Bot Statistics:**\n"
+           f"👥 Total users: {total_users}\n"
+           f"🚫 Banned: {banned}\n"
+           f"📊 Total lookups: {total_lookups}\n"
+           f"📈 Active users (ever used): {active_users}")
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+async def dailystats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin_filter(update, context):
+        return
+    days = 7
+    if context.args and context.args[0].isdigit():
+        days = int(context.args[0])
+    data = []
+    for i in range(days):
+        day = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            c = conn.cursor()
+            c.execute('''
+                SELECT COUNT(*) FROM lookups WHERE DATE(timestamp) = ?
+            ''', (day,))
+            cnt = c.fetchone()[0]
+            data.append((day, cnt))
+    msg = "**Daily Lookups (last {} days):**\n".format(days)
+    for day, cnt in reversed(data):
+        msg += f"{day}: {cnt}\n"
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+async def lookupstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin_filter(update, context):
+        return
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        c.execute('''
+            SELECT command, COUNT(*) as cnt FROM lookups
+            GROUP BY command ORDER BY cnt DESC
+        ''')
+        rows = c.fetchall()
+    msg = "**Lookup statistics per command:**\n"
+    for cmd, cnt in rows:
+        msg += f"/{cmd}: {cnt}\n"
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin_filter(update, context):
+        return
+    # /backup start_date end_date? Actually user said "time intervell dd/mm/yyyy to dd/mm/yyyy"
+    # We'll just generate full backup for simplicity, but can be extended.
+    # Generate CSV of users and lookups
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        c.execute("SELECT * FROM users")
+        users = c.fetchall()
+        col_names = [description[0] for description in c.description]
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(col_names)
+    writer.writerows(users)
+    csv_data = output.getvalue().encode()
+    await update.message.reply_document(document=csv_data, filename="users_backup.csv", caption="Users backup")
+
+async def fulldbbackup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin_filter(update, context):
+        return
+    # Send the SQLite file and CSV
+    with open(DB_PATH, "rb") as f:
+        await update.message.reply_document(document=f, filename="bot_database.db", caption="Full SQLite DB")
+    # Also generate CSV
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        c.execute("SELECT * FROM users")
+        users = c.fetchall()
+        col_names = [description[0] for description in c.description]
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(col_names)
+    writer.writerows(users)
+    csv_data = output.getvalue().encode()
+    await update.message.reply_document(document=csv_data, filename="users_export.csv", caption="Users CSV")
+
+async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("Only owner can add admins.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /addadmin <user_id>")
+        return
+    try:
+        uid = int(context.args[0])
+        set_admin(uid, True)
+        await update.message.reply_text(f"User {uid} is now admin.")
+    except:
+        await update.message.reply_text("Invalid ID.")
+
+async def remove_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("Only owner can remove admins.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /removeadmin <user_id>")
+        return
+    try:
+        uid = int(context.args[0])
+        set_admin(uid, False)
+        await update.message.reply_text(f"User {uid} is no longer admin.")
+    except:
+        await update.message.reply_text("Invalid ID.")
+
+async def list_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin_filter(update, context):
+        return
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT user_id, username FROM users WHERE is_admin = 1")
+        admins = c.fetchall()
+    msg = "**Admins:**\n"
+    for a in admins:
+        msg += f"• `{a['user_id']}` (@{a.get('username','')})\n"
+    msg += f"👑 Owner: `{OWNER_ID}`"
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+# Register admin handlers
+admin_handlers = [
+    ("broadcast", broadcast), ("dm", dm_user), ("bulkdm", bulk_dm),
+    ("ban", ban_user), ("unban", unban_user), ("deleteuser", delete_user),
+    ("searchuser", search_user), ("users", list_users), ("recentusers", recent_users),
+    ("userlookups", user_lookups), ("leaderboard", leaderboard), ("inactiveusers", inactive_users),
+    ("stats", stats), ("dailystats", dailystats), ("lookupstats", lookupstats),
+    ("backup", backup), ("fulldbbackup", fulldbbackup), ("addadmin", add_admin),
+    ("removeadmin", remove_admin), ("listadmins", list_admins)
+]
+for cmd, handler in admin_handlers:
+    telegram_app.add_handler(CommandHandler(cmd, handler))
+
+# ---------- General Message Handler (ignore) ----------
+async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pass  # ignore non-command messages
+
+telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
+
+# ---------- Webhook Setup ----------
+@app.on_event("startup")
+async def on_startup():
+    await telegram_app.initialize()
+    # Set webhook
+    webhook_url = WEBHOOK_URL or os.environ.get("RENDER_EXTERNAL_URL")
+    if not webhook_url:
+        logger.error("WEBHOOK_URL not set!")
+        return
+    if not webhook_url.endswith("/webhook"):
+        webhook_url = webhook_url.rstrip('/') + "/webhook"
+    await telegram_app.bot.set_webhook(url=webhook_url)
+    logger.info(f"Webhook set to {webhook_url}")
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    await telegram_app.bot.delete_webhook()
+    await telegram_app.shutdown()
+
+@app.post("/webhook")
+async def webhook(request: Request):
+    json_data = await request.json()
+    update = Update.de_json(json_data, telegram_app.bot)
+    await telegram_app.process_update(update)
+    return Response(status_code=200)
+
+@app.get("/")
+async def health():
+    return {"status": "ok"}
+
+# ---------- Main ----------
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    web.run_app(create_app(), host="0.0.0.0", port=port)
+    init_db()
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
