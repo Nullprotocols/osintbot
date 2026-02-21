@@ -7,7 +7,7 @@ services:
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: BOT_TOKEN
-        sync: false
+        sync: 8386893309:AAGON6_4pyREasyf2mwfE75YTa42f5VRJPY
       - key: BOT_OWNER_ID
         value: 8104850843
       - key: BOT_ADMIN_IDS
