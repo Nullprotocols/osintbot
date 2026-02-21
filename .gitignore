@@ -1,40 +1,56 @@
-# Byte-compiled / optimized / DLL files
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+pythonenv*
+*.egg-info/
+dist/
+build/
+*.egg
 
-# Virtual environment
+# Virtual Environment
 venv/
 env/
 ENV/
-.venv/
+myenv/
 
 # Environment variables
 .env
+.env.*
+!.env.example
 
-# Database files
+# Database (if any local testing)
 *.db
-*.sqlite
 *.sqlite3
+*.sqlite
 
-# IDE / editor files
+# Logs
+*.log
+*.log.*
+
+# IDE
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
 
-# Logs
-*.log
-
-# OS generated files
+# OS
 .DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
 Thumbs.db
 
-# Render deployment artifacts (optional)
-# (no specific files to ignore, but keep as is)
+# Render / Deployment
+render.yaml  # Optional: if you want to keep it secret; but usually it's safe to commit
+# If you put secrets in render.yaml, better to add it here and use dashboard for sensitive vars.
+# But we didn't put token in render.yaml (we left blank), so it's okay to commit.
+# However, if you added token, definitely add render.yaml to .gitignore!
+
+# Bot data (if any)
+bot_data.db  # old SQLite, not used anymore but just in case
