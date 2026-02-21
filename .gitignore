@@ -47,10 +47,8 @@ myenv/
 Thumbs.db
 
 # Render / Deployment
-render.yaml  # Optional: if you want to keep it secret; but usually it's safe to commit
-# If you put secrets in render.yaml, better to add it here and use dashboard for sensitive vars.
-# But we didn't put token in render.yaml (we left blank), so it's okay to commit.
-# However, if you added token, definitely add render.yaml to .gitignore!
+# Uncomment the next line if you put secrets in render.yaml
+# render.yaml
 
 # Bot data (if any)
-bot_data.db  # old SQLite, not used anymore but just in case
+bot_data.db
